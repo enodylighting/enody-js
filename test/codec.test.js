@@ -1,0 +1,196 @@
+/**
+ * Basic tests for postcard codec and framing logic.
+ * Run with: node test/codec.test.js
+ */
+
+import { PostcardEncoder, PostcardDecoder, uuidV4, uuidToString, uuidFromString } from '../src/postcard.js';
+import { frameBytes, unframeBytes, FrameAccumulator } from '../src/framing.js';
+import { Commands, buildCommandMessage, decodeMessage } from '../src/message.js';
+
+let passed = 0;
+let failed = 0;
+
+function assert(condition, msg) {
+  if (condition) {
+    passed++;
+  } else {
+    failed++;
+    console.error(`FAIL: ${msg}`);
+  }
+}
+
+function assertEq(a, b, msg) {
+  const equal = typeof a === 'object' && typeof b === 'object'
+    ? JSON.stringify(a) === JSON.stringify(b)
+    : a === b;
+  if (equal) {
+    passed++;
+  } else {
+    failed++;
+    console.error(`FAIL: ${msg} — expected ${JSON.stringify(b)}, got ${JSON.stringify(a)}`);
+  }
+}
+
+// --- Varint encoding ---
+{
+  const enc = new PostcardEncoder();
+  enc.varint(0);
+  assertEq(enc.result()[0], 0, 'varint(0)');
+}
+{
+  const enc = new PostcardEncoder();
+  enc.varint(127);
+  assertEq(enc.result()[0], 127, 'varint(127)');
+}
+{
+  const enc = new PostcardEncoder();
+  enc.varint(128);
+  const r = enc.result();
+  assertEq(r[0], 0x80, 'varint(128) byte 0');
+  assertEq(r[1], 0x01, 'varint(128) byte 1');
+}
+{
+  const enc = new PostcardEncoder();
+  enc.varint(300);
+  const dec = new PostcardDecoder(enc.result());
+  assertEq(dec.varint(), 300, 'varint(300) roundtrip');
+}
+
+// --- f32 encoding ---
+{
+  const enc = new PostcardEncoder();
+  enc.f32(4000.0);
+  const dec = new PostcardDecoder(enc.result());
+  const val = dec.f32();
+  assert(Math.abs(val - 4000.0) < 0.01, `f32(4000.0) roundtrip: got ${val}`);
+}
+
+// --- UUID roundtrip ---
+{
+  const uuid = uuidV4();
+  const str = uuidToString(uuid);
+  const back = uuidFromString(str);
+  assertEq(Array.from(uuid), Array.from(back), 'UUID roundtrip');
+  assert(str.length === 36, 'UUID string length');
+  assert(str[14] === '4', 'UUID v4 version nibble');
+}
+
+// --- UUID via postcard ---
+{
+  const uuid = uuidV4();
+  const enc = new PostcardEncoder();
+  enc.uuid(uuid);
+  const dec = new PostcardDecoder(enc.result());
+  const decoded = dec.uuid();
+  assertEq(Array.from(uuid), Array.from(decoded), 'UUID postcard roundtrip');
+}
+
+// --- Option encoding ---
+{
+  const enc = new PostcardEncoder();
+  enc.option(null, () => {});
+  assertEq(enc.result()[0], 0, 'Option None');
+}
+{
+  const enc = new PostcardEncoder();
+  enc.option(42, (e, v) => e.u8(v));
+  const r = enc.result();
+  assertEq(r[0], 1, 'Option Some tag');
+  assertEq(r[1], 42, 'Option Some value');
+}
+
+// --- Frame encoding/decoding ---
+{
+  const payload = new Uint8Array([0x01, 0x02, 0x03, 0x10, 0xFF]);
+  const framed = frameBytes(payload);
+  assertEq(framed[0], 0x02, 'Frame starts with STX');
+  assertEq(framed[framed.length - 1], 0x03, 'Frame ends with ETX');
+
+  const unframed = unframeBytes(framed);
+  assertEq(Array.from(unframed), Array.from(payload), 'Frame roundtrip');
+}
+
+// --- Frame with all control chars ---
+{
+  const payload = new Uint8Array([0x02, 0x03, 0x10]);
+  const framed = frameBytes(payload);
+  const unframed = unframeBytes(framed);
+  assertEq(Array.from(unframed), Array.from(payload), 'Frame with control chars');
+}
+
+// --- FrameAccumulator ---
+{
+  const acc = new FrameAccumulator();
+  const payload = new Uint8Array([0x41, 0x42]); // AB
+  const framed = frameBytes(payload);
+
+  // Feed one byte at a time
+  const allFrames = [];
+  for (const byte of framed) {
+    const frames = acc.feed(new Uint8Array([byte]));
+    allFrames.push(...frames);
+  }
+  assertEq(allFrames.length, 1, 'FrameAccumulator found 1 frame');
+  const unframed = unframeBytes(allFrames[0]);
+  assertEq(Array.from(unframed), [0x41, 0x42], 'FrameAccumulator content');
+}
+
+// --- Command building ---
+{
+  const cmdBytes = Commands.hostInfo();
+  assert(cmdBytes instanceof Uint8Array, 'hostInfo returns Uint8Array');
+  // Command::Host = variant 1, HostCommand::Info = variant 0
+  assertEq(cmdBytes[0], 1, 'hostInfo: Command::Host variant');
+  assertEq(cmdBytes[1], 0, 'hostInfo: HostCommand::Info variant');
+}
+
+{
+  const cmdBytes = Commands.hostFixtureCount();
+  assertEq(cmdBytes[0], 1, 'hostFixtureCount: Command::Host variant');
+  assertEq(cmdBytes[1], 1, 'hostFixtureCount: HostCommand::FixtureCount variant');
+}
+
+{
+  const cmdBytes = Commands.hostFixtureInfo(0);
+  assertEq(cmdBytes[0], 1, 'hostFixtureInfo(0): Command::Host variant');
+  assertEq(cmdBytes[1], 2, 'hostFixtureInfo(0): HostCommand::FixtureInfo variant');
+  assertEq(cmdBytes[2], 0, 'hostFixtureInfo(0): index=0');
+}
+
+{
+  const cmdBytes = Commands.emitterFluxSet({ value: 0.5 });
+  assertEq(cmdBytes[0], 6, 'emitterFluxSet: Command::Emitter variant');
+  assertEq(cmdBytes[1], 2, 'emitterFluxSet: EmitterCommand::FluxSet variant');
+  assertEq(cmdBytes[2], 0, 'emitterFluxSet: Flux::Relative variant');
+}
+
+{
+  const cmdBytes = Commands.fixtureDisplay(
+    { type: 1, kelvin: 4000.0 }, // Blackbody
+    { value: 0.8 }
+  );
+  assertEq(cmdBytes[0], 4, 'fixtureDisplay: Command::Fixture variant');
+  assertEq(cmdBytes[1], 1, 'fixtureDisplay: FixtureCommand::Display variant');
+  assertEq(cmdBytes[2], 1, 'fixtureDisplay: Configuration::Blackbody variant');
+}
+
+{
+  const cmdBytes = Commands.emitterSpectralSampleBatch(0, 32);
+  assertEq(cmdBytes[0], 6, 'spectralBatch: Command::Emitter variant');
+  assertEq(cmdBytes[1], 3, 'spectralBatch: EmitterCommand::SpectralData variant');
+  assertEq(cmdBytes[2], 4, 'spectralBatch: SpectralDataCommand::SampleBatch variant');
+  assertEq(cmdBytes[3], 0, 'spectralBatch: start=0');
+  assertEq(cmdBytes[4], 32, 'spectralBatch: end=32');
+}
+
+// --- Full message build ---
+{
+  const { identifier, data } = buildCommandMessage(Commands.hostInfo());
+  assert(identifier.length === 16, 'Message identifier is 16 bytes');
+  assert(data[0] === 0x02, 'Message frame starts with STX');
+  assert(data[data.length - 1] === 0x03, 'Message frame ends with ETX');
+}
+
+// --- Summary ---
+console.log(`\nResults: ${passed} passed, ${failed} failed`);
+if (failed > 0) process.exit(1);
