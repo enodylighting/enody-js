@@ -17,6 +17,7 @@ import {
 import { uuidToString } from './postcard.js';
 import { EnodyTransport, EP01_USB_FILTER } from './transport.js';
 import { SpectralData } from './colorimetry.js';
+import { getDefaultSerialProvider } from './serial-provider-registry.js';
 
 const SPECTRAL_BATCH_SIZE = 32;
 
@@ -50,8 +51,9 @@ function resolveSerialProvider(serialOverride) {
     return serialOverride;
   }
 
-  if (typeof navigator !== 'undefined' && navigator.serial) {
-    return navigator.serial;
+  const defaultProvider = getDefaultSerialProvider();
+  if (defaultProvider) {
+    return defaultProvider;
   }
 
   throw new Error('WebSerial is not available in this environment');
@@ -74,14 +76,18 @@ export class UsbEnvironment {
    * the user to pick one when `requestPort` is true.
    */
   async runtimes(options = {}) {
-    const ports = options.ports ? [...options.ports] : await this.serial.getPorts();
+    const portQuery = {
+      filters: options.filters ?? this.options.filters,
+      path: options.path,
+    };
+    const ports = options.ports ? [...options.ports] : await this.serial.getPorts(portQuery);
     const requestPort = options.requestPort ?? ports.length === 0;
 
     if (requestPort) {
-      const requestOptions = {};
-      if (this.options.filters) {
-        requestOptions.filters = this.options.filters;
-      }
+      const requestOptions = {
+        filters: options.filters ?? this.options.filters,
+        path: options.path,
+      };
       ports.push(await this.serial.requestPort(requestOptions));
     }
 

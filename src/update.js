@@ -76,10 +76,10 @@ export class UpdateTarget {
   static async discover(options = {}) {
     if (options.requestPort) {
       const environment = new UsbEnvironment(options);
-      const requestOptions = {};
-      if (environment.options.filters) {
-        requestOptions.filters = environment.options.filters;
-      }
+      const requestOptions = {
+        filters: environment.options.filters,
+        path: options.path,
+      };
 
       const selectedPort = await environment.serial.requestPort(requestOptions);
       return [await UpdateTarget.fromPort(selectedPort, options)];

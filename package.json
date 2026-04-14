@@ -3,13 +3,21 @@
   "version": "0.1.0",
   "description": "JavaScript SDK for Enody spectrally tunable lighting devices and EP01 firmware updates.",
   "type": "module",
-  "main": "./src/index.js",
-  "module": "./src/index.js",
+  "main": "./src/node/index.js",
+  "module": "./src/browser/index.js",
   "exports": {
-    ".": "./src/index.js",
+    ".": {
+      "browser": "./src/browser/index.js",
+      "node": "./src/node/index.js",
+      "default": "./src/browser/index.js"
+    },
     "./data": "./src/data.js",
     "./optimize": "./src/optimize.js",
-    "./update": "./src/update.js",
+    "./update": {
+      "browser": "./src/browser/update-entry.js",
+      "node": "./src/node/update-entry.js",
+      "default": "./src/browser/update-entry.js"
+    },
     "./package.json": "./package.json"
   },
   "files": [
@@ -20,7 +28,8 @@
   ],
   "sideEffects": false,
   "scripts": {
-    "test": "node test/codec.test.js && node test/reference.test.js && node test/interface.test.js && node test/optimizer.test.js"
+    "test": "node test/codec.test.js && node test/reference.test.js && node test/interface.test.js && node test/optimizer.test.js",
+    "test:hil": "node test/hil.test.js"
   },
   "keywords": [
     "enody",
@@ -31,6 +40,9 @@
     "firmware"
   ],
   "license": "MIT",
+  "dependencies": {
+    "serialport": "^13.0.0"
+  },
   "repository": {
     "type": "git",
     "url": "git+ssh://git@github.com/enodylighting/enody-js.git"

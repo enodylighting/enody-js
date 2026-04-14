@@ -6,11 +6,13 @@ This is an LLM port of the enody-py framework, with modifications to support bro
 
 `enody` provides:
 
-- WebSerial-based discovery and control for EP01 hardware
+- One import path that works in both the browser and Node.js
+- WebSerial-based discovery and control for EP01 hardware in browser apps
+- Node-based serial discovery and control for scripts, CLIs, and notebooks
 - A device hierarchy that mirrors the Rust and Python SDKs
 - Bundled sample spectral data for offline development
 - Optimization helpers for spectral matching and chromaticity work
-- Browser firmware update support for EP01 devices
+- Firmware update support for EP01 devices
 
 The browser UI that consumes this SDK now lives in the separate sibling project at `/Users/carter/llm_sandbox/src/js-sdk/enody-web`.
 
@@ -21,6 +23,15 @@ npm install enody
 ```
 
 The package targets modern ESM environments and requires Node 18+ for local tooling.
+
+`import { UsbEnvironment, Configuration, Flux } from 'enody'` resolves to the
+appropriate implementation automatically:
+
+- in Node.js, `enody` uses the Node serial backend
+- in browser builds, `enody` uses WebSerial
+
+That means the same import works in browser apps, scripts, and Node-backed
+notebooks.
 
 ## Quick Start
 
@@ -40,6 +51,25 @@ const fixtures = await host.fixtures();
 const sources = await fixtures[0].sources();
 const emitters = await sources[0].emitters();
 ```
+
+### Use the same import in Node or a notebook
+
+```js
+import { UsbEnvironment, Configuration, Flux } from 'enody';
+
+const env = new UsbEnvironment();
+const runtime = (await env.runtimes())[0];
+const host = await runtime.host();
+const fixture = (await host.fixtures())[0];
+
+await fixture.display(
+  Configuration.blackbody(4000),
+  Flux.relative(0.8),
+);
+```
+
+When multiple serial devices are present in Node, set `ENODY_PORT` to target a
+specific port path.
 
 ### Control a fixture
 
@@ -147,6 +177,18 @@ Run the SDK tests from the package directory:
 
 ```bash
 npm test
+```
+
+Run the optional Node hardware-in-the-loop smoke test with a connected EP01:
+
+```bash
+npm run test:hil
+```
+
+To force a specific serial device in Node:
+
+```bash
+ENODY_PORT=/dev/tty.usbmodem1234 npm run test:hil
 ```
 
 The sibling demo application can be served with:

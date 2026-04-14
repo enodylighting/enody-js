@@ -8,6 +8,7 @@
 import { FrameAccumulator } from './framing.js';
 import { buildCommandMessage, decodeMessage } from './message.js';
 import { uuidToString } from './postcard.js';
+import { getDefaultSerialProvider } from './serial-provider-registry.js';
 
 export const EP01_USB_FILTER = { usbVendorId: 0x303a, usbProductId: 0x1001 };
 const DEFAULT_BAUD_RATE = 115200;
@@ -18,8 +19,9 @@ function resolveSerialProvider(serialOverride) {
     return serialOverride;
   }
 
-  if (typeof navigator !== 'undefined' && navigator.serial) {
-    return navigator.serial;
+  const defaultProvider = getDefaultSerialProvider();
+  if (defaultProvider) {
+    return defaultProvider;
   }
 
   return null;
