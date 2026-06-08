@@ -293,26 +293,29 @@ export class EnodyTransport {
       frameByteLength: data.length,
     };
 
+    const timeoutMs = options.timeoutMs ?? options.responseTimeoutMs ?? this.responseTimeoutMs;
     const promise = new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pendingRequests.delete(idStr);
         emitLog(this.logger, 'warn', 'command:timeout', {
           ...commandLog,
-          timeoutMs: this.responseTimeoutMs,
+          timeoutMs,
         });
-        const error = new Error(`Command timeout (${this.responseTimeoutMs}ms)`);
+        const error = new Error(`Command timeout (${timeoutMs}ms)`);
         error.code = 'ENODY_COMMAND_TIMEOUT';
-        error.timeoutMs = this.responseTimeoutMs;
+        error.timeoutMs = timeoutMs;
         error.command = command;
         error.commandLog = commandLog;
         reject(error);
-      }, this.responseTimeoutMs);
+      }, timeoutMs);
       this.pendingRequests.set(idStr, {
         resolve,
         reject,
         timer,
         commandLog,
         deviceErrorLogLevel: options.deviceErrorLogLevel ?? 'error',
+        responsePredicate: options.responsePredicate ?? null,
+        onIntermediateResponse: options.onIntermediateResponse ?? null,
       });
     });
 
@@ -405,10 +408,9 @@ export class EnodyTransport {
       const ctxStr = uuidToString(msg.context);
       const pending = this.pendingRequests.get(ctxStr);
       if (pending) {
-        this.pendingRequests.delete(ctxStr);
-        clearTimeout(pending.timer);
-
         if (msg.event.type === 'error') {
+          this.pendingRequests.delete(ctxStr);
+          clearTimeout(pending.timer);
           const detail = {
             ...pending.commandLog,
             response: messageLog,
@@ -420,6 +422,21 @@ export class EnodyTransport {
           error.command = pending.commandLog.command;
           pending.reject(error);
         } else {
+          if (pending.responsePredicate && !pending.responsePredicate(msg)) {
+            emitLog(this.logger, 'log', 'command:intermediate-response', {
+              ...pending.commandLog,
+              response: messageLog,
+            });
+            try {
+              pending.onIntermediateResponse?.(msg);
+            } catch (error) {
+              emitLog(this.logger, 'warn', 'command:intermediate-listener-failed', error);
+            }
+            return;
+          }
+
+          this.pendingRequests.delete(ctxStr);
+          clearTimeout(pending.timer);
           emitLog(this.logger, 'log', 'command:response', {
             ...pending.commandLog,
             response: messageLog,

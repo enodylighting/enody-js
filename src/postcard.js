@@ -34,6 +34,11 @@ export class PostcardEncoder {
     return this;
   }
 
+  i8(v) {
+    this.buf.push(v & 0xff);
+    return this;
+  }
+
   u16(v) {
     return this.varint(v);
   }
@@ -109,6 +114,11 @@ export class PostcardDecoder {
 
   u8() {
     return this.data[this.pos++];
+  }
+
+  i8() {
+    const value = this.data[this.pos++];
+    return value > 0x7f ? value - 0x100 : value;
   }
 
   u16() {

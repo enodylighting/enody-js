@@ -245,6 +245,11 @@ export function createNodeSerialProvider() {
       const { SerialPort } = await loadSerialPortModule();
       const filters = options.filters ?? [];
       const ports = await SerialPort.list();
+      if (options.path) {
+        return ports
+          .filter((info) => info.path === options.path)
+          .map((info) => new NodeSerialPortAdapter(info));
+      }
       return ports
         .filter((info) => matchesFilters(info, filters))
         .map((info) => new NodeSerialPortAdapter(info));

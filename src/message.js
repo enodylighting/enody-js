@@ -223,6 +223,220 @@ export function decodeLogEvent(dec) {
   return { level, levelName: LogLevelNames[level] || 'Unknown', output };
 }
 
+// --- Network setup ---
+
+export const NETWORK_SCAN_FILTER_MAX_LEN = 4;
+export const NETWORK_SCAN_RESULT_MAX_LEN = 16;
+export const WIFI_SSID_MAX_LEN = 32;
+export const WIFI_PASSWORD_MAX_LEN = 64;
+
+export const NetworkType = {
+  Wifi: 0,
+};
+
+export const NetworkCredentialsType = {
+  None: 0,
+  Wifi: 1,
+};
+
+export const WifiAuth = {
+  Unknown: 0,
+  Open: 1,
+  Secured: 2,
+};
+
+export const WifiAuthNames = ['Unknown', 'Open', 'Secured'];
+
+export const WifiCredentialsType = {
+  Password: 0,
+};
+
+function assertMaxLength(value, maxLength, label) {
+  if (String(value).length > maxLength) {
+    throw new Error(`${label} must be ${maxLength} characters or fewer`);
+  }
+}
+
+function encodeByteArrayOption(enc, value, length) {
+  enc.option(value, (encoder, bytes) => {
+    if (bytes.length !== length) {
+      throw new Error(`Expected ${length} bytes`);
+    }
+    for (const byte of bytes) {
+      encoder.u8(byte);
+    }
+  });
+}
+
+function decodeByteArrayOption(dec, length) {
+  return dec.option((decoder) => {
+    const bytes = new Uint8Array(length);
+    for (let index = 0; index < length; index += 1) {
+      bytes[index] = decoder.u8();
+    }
+    return bytes;
+  });
+}
+
+export class Network {
+  static wifi(options = {}) {
+    return {
+      type: NetworkType.Wifi,
+      network: WifiNetwork.from(options),
+    };
+  }
+}
+
+export class NetworkCredentials {
+  static none() {
+    return { type: NetworkCredentialsType.None };
+  }
+
+  static wifiPassword(password) {
+    assertMaxLength(password, WIFI_PASSWORD_MAX_LEN, 'WiFi password');
+    return {
+      type: NetworkCredentialsType.Wifi,
+      credentials: {
+        type: WifiCredentialsType.Password,
+        password,
+      },
+    };
+  }
+}
+
+export class WifiNetwork {
+  static from(options = {}) {
+    const ssid = options.ssid ?? null;
+    if (ssid !== null) {
+      assertMaxLength(ssid, WIFI_SSID_MAX_LEN, 'WiFi SSID');
+    }
+
+    return {
+      ssid,
+      bssid: options.bssid ?? null,
+      channel: options.channel ?? null,
+      rssi: options.rssi ?? null,
+      auth: options.auth ?? null,
+    };
+  }
+}
+
+export function wifiAuthName(auth) {
+  return WifiAuthNames[auth] ?? `WifiAuth(${auth})`;
+}
+
+export function encodeWifiNetwork(enc, network) {
+  const value = WifiNetwork.from(network);
+  enc.option(value.ssid, (encoder, ssid) => encoder.string(ssid));
+  encodeByteArrayOption(enc, value.bssid, 6);
+  enc.option(value.channel, (encoder, channel) => encoder.u8(channel));
+  enc.option(value.rssi, (encoder, rssi) => encoder.i8(rssi));
+  enc.option(value.auth, (encoder, auth) => encoder.enumVariant(auth));
+}
+
+export function decodeWifiNetwork(dec) {
+  return {
+    ssid: dec.option((decoder) => decoder.string()),
+    bssid: decodeByteArrayOption(dec, 6),
+    channel: dec.option((decoder) => decoder.u8()),
+    rssi: dec.option((decoder) => decoder.i8()),
+    auth: dec.option((decoder) => decoder.enumVariant()),
+  };
+}
+
+export function encodeNetwork(enc, network) {
+  enc.enumVariant(network.type);
+  switch (network.type) {
+    case NetworkType.Wifi:
+      encodeWifiNetwork(enc, network.network ?? network.wifi ?? network);
+      break;
+    default:
+      throw new Error(`Unknown Network variant: ${network.type}`);
+  }
+}
+
+export function decodeNetwork(dec) {
+  const type = dec.enumVariant();
+  switch (type) {
+    case NetworkType.Wifi:
+      return { type, network: decodeWifiNetwork(dec) };
+    default:
+      throw new Error(`Unknown Network variant: ${type}`);
+  }
+}
+
+export function encodeNetworkList(enc, networks) {
+  enc.varint(networks.length);
+  for (const network of networks) {
+    encodeNetwork(enc, network);
+  }
+}
+
+export function decodeNetworkList(dec) {
+  const count = dec.varint();
+  const networks = [];
+  for (let index = 0; index < count; index += 1) {
+    networks.push(decodeNetwork(dec));
+  }
+  return networks;
+}
+
+export function encodeNetworkCredentials(enc, credentials) {
+  enc.enumVariant(credentials.type);
+  switch (credentials.type) {
+    case NetworkCredentialsType.None:
+      break;
+    case NetworkCredentialsType.Wifi:
+      enc.enumVariant(credentials.credentials.type);
+      if (credentials.credentials.type === WifiCredentialsType.Password) {
+        assertMaxLength(credentials.credentials.password, WIFI_PASSWORD_MAX_LEN, 'WiFi password');
+        enc.string(credentials.credentials.password);
+      } else {
+        throw new Error(`Unknown WifiCredentials variant: ${credentials.credentials.type}`);
+      }
+      break;
+    default:
+      throw new Error(`Unknown NetworkCredentials variant: ${credentials.type}`);
+  }
+}
+
+export function decodeNetworkCredentials(dec) {
+  const type = dec.enumVariant();
+  switch (type) {
+    case NetworkCredentialsType.None:
+      return { type };
+    case NetworkCredentialsType.Wifi: {
+      const credentialType = dec.enumVariant();
+      if (credentialType === WifiCredentialsType.Password) {
+        return {
+          type,
+          credentials: {
+            type: credentialType,
+            password: dec.string(),
+          },
+        };
+      }
+      throw new Error(`Unknown WifiCredentials variant: ${credentialType}`);
+    }
+    default:
+      throw new Error(`Unknown NetworkCredentials variant: ${type}`);
+  }
+}
+
+export function encodeToken(enc, token) {
+  enc.uuid(token.hostId ?? token.host_id);
+  enc.string(token.keyId ?? token.key_id);
+  enc.bytes(token.data);
+}
+
+export function decodeToken(dec) {
+  return {
+    hostId: dec.uuid(),
+    keyId: dec.string(),
+    data: dec.bytes(),
+  };
+}
+
 // --- Command type indices (matching Rust enum order) ---
 
 export const CommandType = {
@@ -235,7 +449,13 @@ export const CommandType = {
   Emitter: 6,
 };
 
-export const HostCmd = { Info: 0, FixtureCount: 1, FixtureInfo: 2 };
+export const HostCmd = {
+  Info: 0,
+  FixtureCount: 1,
+  FixtureInfo: 2,
+  NetworkScan: 3,
+  NetworkJoin: 4,
+};
 export const RuntimeCmd = {
   Info: 0,
   Host: 1,
@@ -244,6 +464,9 @@ export const RuntimeCmd = {
   SettingGet: 4,
   SettingSet: 5,
   SettingDelete: 6,
+  SettingReset: 7,
+  TokenGenerate: 8,
+  TokenRevoke: 9,
 };
 export const FixtureCmd = { Info: 0, Display: 1, SourceCount: 2, SourceInfo: 3 };
 export const SourceCmd = { Info: 0, Display: 1, EmitterCount: 2, EmitterInfo: 3 };
@@ -263,7 +486,15 @@ export const EventType = {
   Emitter: 7,
 };
 
-export const HostEvt = { Info: 0, FixtureCount: 1, FixtureInfo: 2 };
+export const HostEvt = {
+  Info: 0,
+  FixtureCount: 1,
+  FixtureInfo: 2,
+  NetworkScanStart: 3,
+  NetworkScanComplete: 4,
+  NetworkJoinStart: 5,
+  NetworkJoinComplete: 6,
+};
 export const RuntimeEvt = {
   Info: 0,
   Log: 1,
@@ -273,6 +504,11 @@ export const RuntimeEvt = {
   SettingGet: 5,
   SettingSet: 6,
   SettingDelete: 7,
+  SettingReset: 8,
+  TokenGenerateStart: 9,
+  TokenGenerateApproval: 10,
+  TokenGenerated: 11,
+  TokenRevoked: 12,
 };
 export const FixtureEvt = { Info: 0, Display: 1, SourceCount: 2, SourceInfo: 3 };
 export const SourceEvt = { Info: 0, Display: 1, EmitterCount: 2, EmitterInfo: 3 };
@@ -294,7 +530,7 @@ export const ErrorType = {
 
 const CommandTypeNames = ['Internal', 'Host', 'Runtime', 'Environment', 'Fixture', 'Source', 'Emitter'];
 const CommandVariantNames = {
-  [CommandType.Host]: ['Info', 'FixtureCount', 'FixtureInfo'],
+  [CommandType.Host]: ['Info', 'FixtureCount', 'FixtureInfo', 'NetworkScan', 'NetworkJoin'],
   [CommandType.Runtime]: [
     'Info',
     'Host',
@@ -303,6 +539,9 @@ const CommandVariantNames = {
     'SettingGet',
     'SettingSet',
     'SettingDelete',
+    'SettingReset',
+    'TokenGenerate',
+    'TokenRevoke',
   ],
   [CommandType.Fixture]: ['Info', 'Display', 'SourceCount', 'SourceInfo'],
   [CommandType.Source]: ['Info', 'Display', 'EmitterCount', 'EmitterInfo'],
@@ -383,14 +622,31 @@ export function describeCommand(commandBytes) {
       name: `${typeName}.${variantName}`,
     };
 
-    if (type === CommandType.Host && variant === HostCmd.FixtureInfo) {
-      description.index = dec.u32();
+    if (type === CommandType.Host) {
+      if (variant === HostCmd.FixtureInfo) {
+        description.index = dec.u32();
+      } else if (variant === HostCmd.NetworkScan) {
+        description.filterCount = decodeNetworkList(dec).length;
+      } else if (variant === HostCmd.NetworkJoin) {
+        description.network = decodeNetwork(dec);
+        const credentialsType = dec.enumVariant();
+        description.credentialsType = credentialsType;
+        if (credentialsType === NetworkCredentialsType.Wifi) {
+          const wifiCredentialsType = dec.enumVariant();
+          description.wifiCredentialsType = wifiCredentialsType;
+          if (wifiCredentialsType === WifiCredentialsType.Password) {
+            description.passwordLength = dec.string().length;
+          }
+        }
+      }
     } else if (type === CommandType.Runtime) {
       if (variant === RuntimeCmd.SettingGet || variant === RuntimeCmd.SettingDelete) {
         description.key = dec.string();
       } else if (variant === RuntimeCmd.SettingSet) {
         description.key = dec.string();
         description.valueByteLength = dec.bytes().length;
+      } else if (variant === RuntimeCmd.TokenRevoke) {
+        description.keyId = dec.string();
       }
     } else if (type === CommandType.Fixture && variant === FixtureCmd.SourceInfo) {
       description.index = dec.u32();
@@ -429,6 +685,13 @@ export const Commands = {
   hostInfo: () => encodeCommand(CommandType.Host, HostCmd.Info),
   hostFixtureCount: () => encodeCommand(CommandType.Host, HostCmd.FixtureCount),
   hostFixtureInfo: (idx) => encodeCommand(CommandType.Host, HostCmd.FixtureInfo, e => e.u32(idx)),
+  hostNetworkScan: (filters) => encodeCommand(CommandType.Host, HostCmd.NetworkScan, (e) => {
+    encodeNetworkList(e, filters);
+  }),
+  hostNetworkJoin: (network, credentials) => encodeCommand(CommandType.Host, HostCmd.NetworkJoin, (e) => {
+    encodeNetwork(e, network);
+    encodeNetworkCredentials(e, credentials);
+  }),
 
   // Runtime commands
   runtimeInfo: () => encodeCommand(CommandType.Runtime, RuntimeCmd.Info),
@@ -442,6 +705,11 @@ export const Commands = {
   }),
   runtimeSettingDelete: (key) => encodeCommand(CommandType.Runtime, RuntimeCmd.SettingDelete, (e) => {
     e.string(key);
+  }),
+  runtimeSettingReset: () => encodeCommand(CommandType.Runtime, RuntimeCmd.SettingReset),
+  runtimeTokenGenerate: () => encodeCommand(CommandType.Runtime, RuntimeCmd.TokenGenerate),
+  runtimeTokenRevoke: (keyId) => encodeCommand(CommandType.Runtime, RuntimeCmd.TokenRevoke, (e) => {
+    e.string(keyId);
   }),
 
   // Fixture commands
@@ -542,6 +810,10 @@ function decodeHostEvent(dec) {
     case HostEvt.Info: return { type: 'info', data: decodeHostInfo(dec) };
     case HostEvt.FixtureCount: return { type: 'fixtureCount', count: dec.u32() };
     case HostEvt.FixtureInfo: return { type: 'fixtureInfo', data: decodeFixtureInfo(dec) };
+    case HostEvt.NetworkScanStart: return { type: 'networkScanStart', filters: decodeNetworkList(dec) };
+    case HostEvt.NetworkScanComplete: return { type: 'networkScanComplete', networks: decodeNetworkList(dec) };
+    case HostEvt.NetworkJoinStart: return { type: 'networkJoinStart', network: decodeNetwork(dec) };
+    case HostEvt.NetworkJoinComplete: return { type: 'networkJoinComplete', network: decodeNetwork(dec) };
     default: throw new Error(`Unknown HostEvent variant: ${v}`);
   }
 }
@@ -564,6 +836,16 @@ function decodeRuntimeEvent(dec) {
       return { type: 'settingSet', key: dec.string() };
     case RuntimeEvt.SettingDelete:
       return { type: 'settingDelete', key: dec.string() };
+    case RuntimeEvt.SettingReset:
+      return { type: 'settingReset' };
+    case RuntimeEvt.TokenGenerateStart:
+      return { type: 'tokenGenerateStart' };
+    case RuntimeEvt.TokenGenerateApproval:
+      return { type: 'tokenGenerateApproval', approval: dec.string() };
+    case RuntimeEvt.TokenGenerated:
+      return { type: 'tokenGenerated', token: decodeToken(dec) };
+    case RuntimeEvt.TokenRevoked:
+      return { type: 'tokenRevoked', keyId: dec.string() };
     default: throw new Error(`Unknown RuntimeEvent variant: ${v}`);
   }
 }

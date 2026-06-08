@@ -13,6 +13,8 @@ import {
   Commands,
   Configuration,
   Flux,
+  Network,
+  NetworkCredentials,
   decodeConfigurationList,
   encodeConfigurationList,
 } from './message.js';
@@ -22,6 +24,8 @@ import { SpectralData } from './colorimetry.js';
 import { getDefaultSerialProvider } from './serial-provider-registry.js';
 
 const SPECTRAL_BATCH_SIZE = 32;
+const NETWORK_COMMAND_TIMEOUT_MS = 10000;
+const TOKEN_GENERATE_TIMEOUT_MS = 30000;
 export const CONFIGURATION_PRESETS_KEY = 'dev.enody.configuration-presets';
 
 function defaultLogListener(logEvent) {
@@ -324,6 +328,15 @@ export class Runtime {
     }
   }
 
+  async settingReset() {
+    const message = await this.transport.sendCommand(Commands.runtimeSettingReset());
+    const event = message.event.event;
+
+    if (event.type !== 'settingReset') {
+      throw new Error('Unexpected response while resetting runtime settings');
+    }
+  }
+
   async settingGet(key, decodeValue) {
     const bytes = await this.settingGetBytes(key);
     if (bytes === null) {
@@ -362,6 +375,46 @@ export class Runtime {
     const encoder = new PostcardEncoder();
     encodeConfigurationList(encoder, configurations);
     await this.settingSetBytes(CONFIGURATION_PRESETS_KEY, encoder.result());
+  }
+
+  async generateToken(options = {}) {
+    const message = await this.transport.sendCommand(
+      Commands.runtimeTokenGenerate(),
+      null,
+      null,
+      {
+        timeoutMs: options.timeoutMs ?? TOKEN_GENERATE_TIMEOUT_MS,
+        responsePredicate: (response) => (
+          response.event?.type === 'runtime'
+          && response.event.event?.type === 'tokenGenerated'
+        ),
+        onIntermediateResponse: (response) => {
+          const event = response.event?.event;
+          if (event?.type === 'tokenGenerateApproval') {
+            options.onApproval?.(event.approval);
+          } else if (event?.type === 'tokenGenerateStart') {
+            options.onStart?.();
+          }
+        },
+      },
+    );
+    return message.event.event.token;
+  }
+
+  async revokeToken(keyId, options = {}) {
+    const message = await this.transport.sendCommand(
+      Commands.runtimeTokenRevoke(keyId),
+      null,
+      null,
+      {
+        timeoutMs: options.timeoutMs ?? NETWORK_COMMAND_TIMEOUT_MS,
+      },
+    );
+    const event = message.event.event;
+
+    if (event.type !== 'tokenRevoked' || event.keyId !== keyId) {
+      throw new Error('Unexpected response while revoking runtime token');
+    }
   }
 
   isConnected() {
@@ -439,6 +492,64 @@ export class Host {
 
   async getFixtures() {
     return this.fixtures();
+  }
+
+  async networkScan(filters, options = {}) {
+    const message = await this.transport.sendCommand(
+      Commands.hostNetworkScan(filters),
+      this._resourceIdentifier,
+      null,
+      {
+        timeoutMs: options.timeoutMs ?? NETWORK_COMMAND_TIMEOUT_MS,
+        responsePredicate: (response) => (
+          response.event?.type === 'host'
+          && response.event.event?.type === 'networkScanComplete'
+        ),
+        onIntermediateResponse: options.onIntermediateResponse,
+      },
+    );
+    const event = message.event.event;
+
+    if (event.type !== 'networkScanComplete') {
+      throw new Error('Unexpected response while scanning networks');
+    }
+
+    return event.networks;
+  }
+
+  async networkJoin(network, credentials, options = {}) {
+    const message = await this.transport.sendCommand(
+      Commands.hostNetworkJoin(network, credentials),
+      this._resourceIdentifier,
+      null,
+      {
+        timeoutMs: options.timeoutMs ?? NETWORK_COMMAND_TIMEOUT_MS,
+        responsePredicate: (response) => (
+          response.event?.type === 'host'
+          && response.event.event?.type === 'networkJoinComplete'
+        ),
+        onIntermediateResponse: options.onIntermediateResponse,
+      },
+    );
+    const event = message.event.event;
+
+    if (event.type !== 'networkJoinComplete') {
+      throw new Error('Unexpected response while joining network');
+    }
+
+    return event.network;
+  }
+
+  async wifiScan(options = {}) {
+    return this.networkScan([Network.wifi()], options);
+  }
+
+  async wifiJoin(ssid, password = '', options = {}) {
+    const network = Network.wifi({ ssid });
+    const credentials = password
+      ? NetworkCredentials.wifiPassword(password)
+      : NetworkCredentials.none();
+    return this.networkJoin(network, credentials, options);
   }
 }
 

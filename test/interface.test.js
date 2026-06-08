@@ -5,20 +5,35 @@
 
 import {
   CONFIGURATION_PRESETS_KEY,
+  Commands,
   Configuration,
   Emitter,
+  EnodyTransport,
   Fixture,
+  Host,
+  Network,
+  NetworkCredentials,
   Runtime,
   Source,
   SpectralData,
   Version,
+  WifiAuth,
   sampleEmitter,
   sampleFixture,
   sampleFixtureJson,
   sampleSource,
 } from '../src/index.js';
-import { decodeConfigurationList, encodeConfigurationList } from '../src/message.js';
-import { PostcardDecoder, PostcardEncoder } from '../src/postcard.js';
+import {
+  EventType,
+  HostEvt,
+  decodeConfigurationList,
+  decodeNetwork,
+  decodeNetworkCredentials,
+  encodeConfigurationList,
+  encodeNetworkList,
+} from '../src/message.js';
+import { frameBytes } from '../src/framing.js';
+import { PostcardDecoder, PostcardEncoder, uuidFromString, uuidV4 } from '../src/postcard.js';
 
 let passed = 0;
 let failed = 0;
@@ -52,6 +67,18 @@ function assertConfigurationListEq(actual, expected, message) {
   });
 
   assert(equal, message);
+}
+
+function hostEventFrame(context, hostEventVariant, encodePayload) {
+  const enc = new PostcardEncoder();
+  enc.enumVariant(1); // Message::Event
+  enc.uuid(uuidV4());
+  enc.option(context, (encoder, uuid) => encoder.uuid(uuid));
+  enc.option(null, () => {});
+  enc.enumVariant(EventType.Host);
+  enc.enumVariant(hostEventVariant);
+  encodePayload?.(enc);
+  return frameBytes(enc.result());
 }
 
 const fixtureJson = sampleFixtureJson();
@@ -186,6 +213,99 @@ function spectralMeasurementsFromJson(spectralDataJson) {
   assert(hostInfoAttempts === 1, 'Runtime.host falls back to Host::Info');
   assert(host.identifier() === hostInfo.identifier, 'Runtime host fallback returns host info');
   assert(host.versionString === '1.2.3', 'Runtime host fallback preserves version');
+}
+
+// --- Host WiFi setup helpers ---
+{
+  const networks = [
+    Network.wifi({
+      ssid: 'Studio WiFi',
+      rssi: -51,
+      auth: WifiAuth.Secured,
+    }),
+  ];
+  let scanOptions = null;
+  let joinNetwork = null;
+  let joinCredentials = null;
+
+  const host = new Host({
+    async sendCommand(commandBytes, resource, context, options) {
+      if (commandBytes[0] === 1 && commandBytes[1] === 3) {
+        scanOptions = options;
+        return {
+          event: {
+            event: {
+              type: 'networkScanComplete',
+              networks,
+            },
+          },
+        };
+      }
+
+      if (commandBytes[0] === 1 && commandBytes[1] === 4) {
+        const decoder = new PostcardDecoder(commandBytes.slice(2));
+        joinNetwork = decodeNetwork(decoder);
+        joinCredentials = decodeNetworkCredentials(decoder);
+        return {
+          event: {
+            event: {
+              type: 'networkJoinComplete',
+              network: joinNetwork,
+            },
+          },
+        };
+      }
+
+      throw new Error(`Unexpected command ${Array.from(commandBytes).join(',')}`);
+    },
+  }, {
+    identifier: 'host-id',
+    version: new Version(1, 2, 3),
+  });
+
+  const scanned = await host.wifiScan();
+  await host.wifiJoin('Studio WiFi', 'secret-pass');
+
+  assert(scanned[0].network.ssid === 'Studio WiFi', 'Host.wifiScan returns WiFi networks');
+  assert(typeof scanOptions.responsePredicate === 'function', 'Host.wifiScan waits for scan completion');
+  assert(joinNetwork.network.ssid === 'Studio WiFi', 'Host.wifiJoin encodes target SSID');
+  assert(joinCredentials.credentials.password === 'secret-pass', 'Host.wifiJoin encodes password credentials');
+}
+
+// --- Transport waits for terminal correlated WiFi event ---
+{
+  const transport = new EnodyTransport();
+  transport.port = {};
+  transport.writer = { write: async () => {} };
+
+  const networks = [Network.wifi({ ssid: 'Studio WiFi', auth: WifiAuth.Secured })];
+  const response = transport.sendCommand(
+    Commands.hostNetworkScan([Network.wifi()]),
+    null,
+    null,
+    {
+      timeoutMs: 100,
+      responsePredicate: (message) => (
+        message.event?.type === 'host'
+        && message.event.event?.type === 'networkScanComplete'
+      ),
+    },
+  );
+
+  const [contextId] = transport.pendingRequests.keys();
+  const context = uuidFromString(contextId);
+
+  transport._handleFrame(hostEventFrame(context, HostEvt.NetworkScanStart, (enc) => {
+    encodeNetworkList(enc, [Network.wifi()]);
+  }));
+  assert(transport.pendingRequests.has(contextId), 'Transport keeps WiFi scan pending after start event');
+
+  transport._handleFrame(hostEventFrame(context, HostEvt.NetworkScanComplete, (enc) => {
+    encodeNetworkList(enc, networks);
+  }));
+  const message = await response;
+  assert(!transport.pendingRequests.has(contextId), 'Transport clears WiFi scan after complete event');
+  assert(message.event.event.networks[0].network.ssid === 'Studio WiFi', 'Transport resolves with scan completion');
 }
 
 // --- Runtime configuration presets ---

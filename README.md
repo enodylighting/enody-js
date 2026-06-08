@@ -106,6 +106,20 @@ await runtime.setConfigurationPresets(presets);
 `runtime.configurationPresets()` reads the same runtime setting used by the
 Rust host tooling for EP01 appearance presets.
 
+### Pair EP01 with WiFi
+
+WiFi setup runs over an already trusted USB/WebSerial connection:
+
+```js
+const host = await runtime.host();
+const networks = await host.wifiScan();
+
+await host.wifiJoin('Studio WiFi', 'network-password');
+```
+
+Pass an empty password for open networks. Lower-level `networkScan()` and
+`networkJoin()` helpers are also exported for non-WiFi network variants.
+
 ### Enable SDK diagnostics
 
 Transport diagnostics are quiet by default. During hardware bring-up or support
@@ -195,6 +209,7 @@ Key exports:
 
 - `UsbEnvironment`, `Runtime`, `Host`, `Fixture`, `Source`, `Emitter`
 - `Configuration`, `Flux`, `Version`
+- `Network`, `NetworkCredentials`, `WifiAuth`, `WifiNetwork`
 - `describeCommand`, `ErrorType`, `errorTypeName`
 - `CONFIGURATION_PRESETS_KEY`
 - `sampleFixture`, `sampleSource`, `sampleEmitter`

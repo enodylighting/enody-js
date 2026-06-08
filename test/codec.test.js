@@ -8,8 +8,15 @@ import { frameBytes, unframeBytes, FrameAccumulator } from '../src/framing.js';
 import {
   Commands,
   ErrorType,
+  HostEvt,
+  EventType,
+  Network,
+  NetworkCredentials,
+  WifiAuth,
   buildCommandMessage,
   decodeConfigurationList,
+  decodeMessage,
+  encodeNetworkList,
   describeCommand,
   encodeConfigurationList,
   errorTypeName,
@@ -59,6 +66,18 @@ function assertConfigurationListEq(actual, expected, message) {
   });
 
   assert(equal, message);
+}
+
+function hostEventFrame(hostEventVariant, encodePayload) {
+  const enc = new PostcardEncoder();
+  enc.enumVariant(1); // Message::Event
+  enc.uuid(uuidV4());
+  enc.option(null, () => {});
+  enc.option(null, () => {});
+  enc.enumVariant(EventType.Host);
+  enc.enumVariant(hostEventVariant);
+  encodePayload?.(enc);
+  return frameBytes(enc.result());
 }
 
 // --- Varint encoding ---
@@ -188,6 +207,28 @@ function assertConfigurationListEq(actual, expected, message) {
 }
 
 {
+  const cmdBytes = Commands.hostNetworkScan([Network.wifi()]);
+  assertEq(cmdBytes[0], 1, 'hostNetworkScan: Command::Host variant');
+  assertEq(cmdBytes[1], 3, 'hostNetworkScan: HostCommand::NetworkScan variant');
+  assertEq(cmdBytes[2], 1, 'hostNetworkScan: one filter');
+  assertEq(cmdBytes[3], 0, 'hostNetworkScan: Network::Wifi variant');
+}
+
+{
+  const cmdBytes = Commands.hostNetworkJoin(
+    Network.wifi({ ssid: 'Studio WiFi' }),
+    NetworkCredentials.wifiPassword('secret-pass'),
+  );
+  const description = describeCommand(cmdBytes);
+  assertEq(cmdBytes[0], 1, 'hostNetworkJoin: Command::Host variant');
+  assertEq(cmdBytes[1], 4, 'hostNetworkJoin: HostCommand::NetworkJoin variant');
+  assertEq(description.name, 'Host.NetworkJoin', 'describeCommand names network joins');
+  assertEq(description.network.network.ssid, 'Studio WiFi', 'describeCommand decodes WiFi SSID');
+  assertEq(description.credentialsType, 1, 'describeCommand reports WiFi credentials');
+  assertEq(description.passwordLength, 11, 'describeCommand reports password length');
+}
+
+{
   const cmdBytes = Commands.emitterFluxSet({ value: 0.5 });
   assertEq(cmdBytes[0], 6, 'emitterFluxSet: Command::Emitter variant');
   assertEq(cmdBytes[1], 2, 'emitterFluxSet: EmitterCommand::FluxSet variant');
@@ -250,6 +291,26 @@ function assertConfigurationListEq(actual, expected, message) {
   encodeConfigurationList(enc, presets);
   const decoded = decodeConfigurationList(new PostcardDecoder(enc.result()));
   assertConfigurationListEq(decoded, presets, 'Configuration preset list roundtrip');
+}
+
+{
+  const networks = [
+    Network.wifi({
+      ssid: 'Studio WiFi',
+      bssid: new Uint8Array([1, 2, 3, 4, 5, 6]),
+      channel: 6,
+      rssi: -58,
+      auth: WifiAuth.Secured,
+    }),
+  ];
+  const message = decodeMessage(hostEventFrame(HostEvt.NetworkScanComplete, (enc) => {
+    encodeNetworkList(enc, networks);
+  }));
+  const [network] = message.event.event.networks;
+  assertEq(message.event.event.type, 'networkScanComplete', 'decodeMessage decodes network scan completion');
+  assertEq(network.network.ssid, 'Studio WiFi', 'decodeNetwork decodes SSID');
+  assertEq(network.network.rssi, -58, 'decodeNetwork decodes signed RSSI');
+  assertEq(network.network.auth, WifiAuth.Secured, 'decodeNetwork decodes auth type');
 }
 
 {
