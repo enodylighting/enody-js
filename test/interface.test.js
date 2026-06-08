@@ -86,6 +86,51 @@ function spectralMeasurementsFromJson(spectralDataJson) {
   assert(emitters.length === sourceJson.emitters.length, 'Source emitter count matches JSON');
 }
 
+// --- Source emitter enumeration overreported by firmware ---
+{
+  let infoAttempts = 0;
+  const timeout = new Error('Command timeout (2000ms)');
+  timeout.code = 'ENODY_COMMAND_TIMEOUT';
+  timeout.timeoutMs = 2000;
+
+  const source = new Source({
+    info: { identifier: 'source-id' },
+    transport: {
+      async sendCommand(commandBytes) {
+        if (commandBytes[0] === 5 && commandBytes[1] === 2) {
+          return {
+            event: {
+              event: {
+                count: 3,
+              },
+            },
+          };
+        }
+
+        if (commandBytes[0] === 5 && commandBytes[1] === 3) {
+          infoAttempts++;
+          if (commandBytes[2] === 0) {
+            return {
+              event: {
+                event: {
+                  data: { identifier: 'emitter-id' },
+                },
+              },
+            };
+          }
+          throw timeout;
+        }
+
+        throw new Error(`Unexpected command ${Array.from(commandBytes).join(',')}`);
+      },
+    },
+  });
+
+  const emitters = await source.emitters();
+  assert(emitters.length === 1, 'Source.emitters stops after timeout on overreported emitter count');
+  assert(infoAttempts === 2, 'Source.emitters stops at the first timed-out extra emitter');
+}
+
 // --- Fixture deserialization ---
 {
   const fixture = Fixture.fromJson(fixtureJson);

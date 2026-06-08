@@ -72,6 +72,10 @@ const CMD = {
   GET_SECURITY_INFO: 0x14,
 };
 
+const CMD_NAMES = Object.fromEntries(
+  Object.entries(CMD).map(([name, value]) => [value, name]),
+);
+
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 const CHECKSUM_MAGIC = 0xef;
@@ -294,8 +298,7 @@ export class ESPFlasher {
 
     this.log(`Chip: ${this.chipName}${this.secureDownloadMode ? ' (Secure Download Mode)' : ''}`);
 
-    if (this.secureDownloadMode) {
-      // SDM initialization: attach SPI and set flash parameters
+    if (this.chipId === CHIP_ID_ESP32_C6 || this.secureDownloadMode) {
       this.log('Configuring SPI flash...');
       await this._spiAttach();
       await this._spiSetParams(4 * 1024 * 1024); // 4MB default
@@ -471,7 +474,9 @@ export class ESPFlasher {
 
     const eraseTimeout = Math.max(DEFAULT_TIMEOUT,
       Math.ceil(ERASE_WRITE_TIMEOUT_PER_MB * eraseSize / 1000000));
+    this.log(`Preparing flash region at 0x${address.toString(16)} (${eraseSize} bytes)...`);
     await this._command(CMD.FLASH_BEGIN, beginData, 0, eraseTimeout);
+    this.log(`Writing ${numBlocks} block${numBlocks === 1 ? '' : 's'}...`);
 
     // FLASH_DATA: write blocks
     for (let seq = 0; seq < numBlocks; seq++) {
@@ -538,11 +543,29 @@ export class ESPFlasher {
     await this.transport.writeSlip(packet);
 
     // Read response
-    return this._readResponse(opcode, timeout);
+    try {
+      return await this._readResponse(opcode, timeout);
+    } catch (error) {
+      const commandName = CMD_NAMES[opcode] ?? `0x${opcode.toString(16)}`;
+      throw new Error(`${commandName} failed: ${error.message}`);
+    }
   }
 
   async _readResponse(expectedOp, timeout = DEFAULT_TIMEOUT) {
-    const resp = await this.transport.readSlip(timeout);
+    const deadline = Date.now() + timeout;
+    let resp = null;
+
+    while (Date.now() < deadline) {
+      resp = await this.transport.readSlip(Math.max(1, deadline - Date.now()));
+      if (resp.length >= 2 && resp[1] !== expectedOp) {
+        continue;
+      }
+      break;
+    }
+
+    if (!resp) {
+      throw new Error('Read timeout');
+    }
 
     if (resp.length < 8) {
       throw new Error(`Response too short (${resp.length} bytes)`);

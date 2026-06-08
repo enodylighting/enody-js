@@ -14,7 +14,8 @@ This is an LLM port of the enody-py framework, with modifications to support bro
 - Optimization helpers for spectral matching and chromaticity work
 - Firmware update support for EP01 devices
 
-The browser UI that consumes this SDK now lives in the separate sibling project at `/Users/carter/llm_sandbox/src/js-sdk/enody-web`.
+The browser dashboard that consumes this SDK lives in the sibling
+`device-dashboard` project.
 
 ## Installation
 
@@ -105,6 +106,18 @@ await runtime.setConfigurationPresets(presets);
 `runtime.configurationPresets()` reads the same runtime setting used by the
 Rust host tooling for EP01 appearance presets.
 
+### Enable SDK diagnostics
+
+Transport diagnostics are quiet by default. During hardware bring-up or support
+sessions, pass a console-like logger or `debug: true`:
+
+```js
+const environment = new UsbEnvironment({ logger: console });
+```
+
+Command timeouts reject with `code: 'ENODY_COMMAND_TIMEOUT'`, and device errors
+include `deviceError` and `command` fields for application-level handling.
+
 ### Work offline with bundled sample data
 
 ```js
@@ -182,6 +195,7 @@ Key exports:
 
 - `UsbEnvironment`, `Runtime`, `Host`, `Fixture`, `Source`, `Emitter`
 - `Configuration`, `Flux`, `Version`
+- `describeCommand`, `ErrorType`, `errorTypeName`
 - `CONFIGURATION_PRESETS_KEY`
 - `sampleFixture`, `sampleSource`, `sampleEmitter`
 - `SpectralOptimizer`, `GPUCompute`, `computeChromaticity`, `computeSSI`

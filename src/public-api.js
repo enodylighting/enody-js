@@ -19,13 +19,17 @@ export {
   Commands,
   Configuration,
   ConfigurationType,
+  ErrorType,
+  ErrorTypeNames,
   Flux,
   FluxType,
   StoredSettingType,
   Version,
   compareVersions,
   decodeConfigurationList,
+  describeCommand,
   encodeConfigurationList,
+  errorTypeName,
 } from './message.js';
 export {
   sampleFixture,

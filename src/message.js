@@ -292,12 +292,46 @@ export const ErrorType = {
   Timeout: 8,
 };
 
+const CommandTypeNames = ['Internal', 'Host', 'Runtime', 'Environment', 'Fixture', 'Source', 'Emitter'];
+const CommandVariantNames = {
+  [CommandType.Host]: ['Info', 'FixtureCount', 'FixtureInfo'],
+  [CommandType.Runtime]: [
+    'Info',
+    'Host',
+    'EnvironmentCount',
+    'EnvironmentInfo',
+    'SettingGet',
+    'SettingSet',
+    'SettingDelete',
+  ],
+  [CommandType.Fixture]: ['Info', 'Display', 'SourceCount', 'SourceInfo'],
+  [CommandType.Source]: ['Info', 'Display', 'EmitterCount', 'EmitterInfo'],
+  [CommandType.Emitter]: ['Info', 'FluxRange', 'FluxSet', 'SpectralData'],
+};
+const SpectralDataCommandNames = ['Info', 'Domain', 'SampleCount', 'Sample', 'SampleBatch'];
+
+export const ErrorTypeNames = [
+  'Unknown',
+  'Debug',
+  'Unsupported',
+  'USB',
+  'Serialization',
+  'Busy',
+  'InsufficientData',
+  'UnexpectedResponse',
+  'Timeout',
+];
+
+export function errorTypeName(type) {
+  return ErrorTypeNames[type] ?? `ErrorType(${type})`;
+}
+
 function decodeError(dec) {
   const variant = dec.enumVariant();
   switch (variant) {
-    case ErrorType.Debug: return { type: variant, message: dec.string() };
-    case ErrorType.USB: return { type: variant, message: dec.string() };
-    default: return { type: variant };
+    case ErrorType.Debug: return { type: variant, name: errorTypeName(variant), message: dec.string() };
+    case ErrorType.USB: return { type: variant, name: errorTypeName(variant), message: dec.string() };
+    default: return { type: variant, name: errorTypeName(variant) };
   }
 }
 
@@ -334,6 +368,58 @@ export function encodeCommand(type, subVariant, encodeFn) {
   enc.enumVariant(subVariant);
   if (encodeFn) encodeFn(enc);
   return enc.result();
+}
+
+export function describeCommand(commandBytes) {
+  try {
+    const dec = new PostcardDecoder(commandBytes);
+    const type = dec.enumVariant();
+    const variant = dec.enumVariant();
+    const typeName = CommandTypeNames[type] ?? `CommandType(${type})`;
+    const variantName = CommandVariantNames[type]?.[variant] ?? `Variant(${variant})`;
+    const description = {
+      type,
+      variant,
+      name: `${typeName}.${variantName}`,
+    };
+
+    if (type === CommandType.Host && variant === HostCmd.FixtureInfo) {
+      description.index = dec.u32();
+    } else if (type === CommandType.Runtime) {
+      if (variant === RuntimeCmd.SettingGet || variant === RuntimeCmd.SettingDelete) {
+        description.key = dec.string();
+      } else if (variant === RuntimeCmd.SettingSet) {
+        description.key = dec.string();
+        description.valueByteLength = dec.bytes().length;
+      }
+    } else if (type === CommandType.Fixture && variant === FixtureCmd.SourceInfo) {
+      description.index = dec.u32();
+    } else if (type === CommandType.Source && variant === SourceCmd.EmitterInfo) {
+      description.index = dec.u32();
+    } else if (type === CommandType.Emitter && variant === EmitterCmd.SpectralData) {
+      const spectralVariant = dec.enumVariant();
+      description.name = `${description.name}.${SpectralDataCommandNames[spectralVariant] ?? `Variant(${spectralVariant})`}`;
+      description.spectralVariant = spectralVariant;
+      if (spectralVariant === SpectralDataCmd.Sample) {
+        description.index = dec.u32();
+      } else if (spectralVariant === SpectralDataCmd.SampleBatch) {
+        description.start = dec.u32();
+        description.end = dec.u32();
+      }
+    }
+
+    if (dec.remaining() > 0) {
+      description.remainingBytes = dec.remaining();
+    }
+
+    return description;
+  } catch (error) {
+    return {
+      name: 'Unknown command',
+      byteLength: commandBytes?.length ?? null,
+      error: error.message,
+    };
+  }
 }
 
 // --- Shortcut command builders ---

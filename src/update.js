@@ -205,18 +205,23 @@ export class UpdateTarget {
     }
 
     if (this.runtime?.isConnected()) {
+      options.onLog?.('Closing runtime connection before entering ROM bootloader...');
       await this.runtime.disconnect();
+      options.onLog?.('Runtime connection closed.');
     }
 
     const flasher = new ESPFlasher(this.port, {
       log: options.onLog,
     });
 
-    options.onLog?.('Connecting to ROM bootloader...');
-    await flasher.connect(options.baudrate);
-    await flasher.flash(payloads, options.onProgress);
-    await flasher.reboot();
-    await flasher.disconnect();
+    try {
+      options.onLog?.('Connecting to ROM bootloader...');
+      await flasher.connect(options.baudrate);
+      await flasher.flash(payloads, options.onProgress);
+      await flasher.reboot();
+    } finally {
+      await flasher.disconnect();
+    }
   }
 
   async updateDevice(version, options = {}) {

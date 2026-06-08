@@ -30,6 +30,69 @@ function defaultLogListener(logEvent) {
   logger.call(console, logEvent.output);
 }
 
+const LOG_PREFIX = '[enody-sdk]';
+
+function normalizeLogger(logger) {
+  if (logger === true) {
+    return console;
+  }
+  if (!logger) {
+    return null;
+  }
+  if (typeof logger === 'function') {
+    return { log: logger, warn: logger, error: logger };
+  }
+  return logger;
+}
+
+function emitLog(logger, level, message, detail = undefined) {
+  if (!logger) {
+    return;
+  }
+
+  const target = logger[level] ?? logger.log;
+  if (typeof target !== 'function') {
+    return;
+  }
+
+  if (detail === undefined) {
+    target.call(logger, `${LOG_PREFIX} ${message}`);
+    return;
+  }
+  target.call(logger, `${LOG_PREFIX} ${message}`, detail);
+}
+
+function formatUsbId(value) {
+  return value === undefined ? undefined : `0x${value.toString(16).padStart(4, '0')}`;
+}
+
+function summarizeSerialPort(port) {
+  let info = null;
+  try {
+    info = typeof port?.getInfo === 'function' ? port.getInfo() : null;
+  } catch (error) {
+    info = { error: error.message };
+  }
+
+  return {
+    usbVendorId: formatUsbId(info?.usbVendorId),
+    usbProductId: formatUsbId(info?.usbProductId),
+    readable: Boolean(port?.readable),
+    writable: Boolean(port?.writable),
+  };
+}
+
+function summarizeDeviceInfo(info) {
+  if (!info) {
+    return null;
+  }
+
+  return {
+    identifier: info.identifier ? uuidToString(info.identifier) : null,
+    version: info.version?.toString?.() ?? null,
+  };
+}
+
 function normalizeFlux(flux) {
   if (typeof flux === 'number') {
     return Flux.relative(flux);
@@ -47,6 +110,10 @@ function normalizeIdentifier(identifier) {
 
 function unreachableResource(methodName) {
   throw new Error(`${methodName} requires a device-backed resource`);
+}
+
+function isCommandTimeout(error) {
+  return error?.code === 'ENODY_COMMAND_TIMEOUT';
 }
 
 function resolveSerialProvider(serialOverride) {
@@ -70,6 +137,7 @@ export class UsbEnvironment {
     };
     this.serial = resolveSerialProvider(options.serial);
     this._runtimes = [];
+    this.logger = normalizeLogger(options.logger ?? (options.debug ? console : null));
   }
 
   /**
@@ -83,7 +151,12 @@ export class UsbEnvironment {
       filters: options.filters ?? this.options.filters,
       path: options.path,
     };
+    emitLog(this.logger, 'log', 'environment:runtimes:get-ports', portQuery);
     const ports = options.ports ? [...options.ports] : await this.serial.getPorts(portQuery);
+    emitLog(this.logger, 'log', 'environment:runtimes:granted-ports', {
+      count: ports.length,
+      ports: ports.map(summarizeSerialPort),
+    });
     const requestPort = options.requestPort ?? ports.length === 0;
 
     if (requestPort) {
@@ -91,20 +164,47 @@ export class UsbEnvironment {
         filters: options.filters ?? this.options.filters,
         path: options.path,
       };
-      ports.push(await this.serial.requestPort(requestOptions));
+      emitLog(this.logger, 'log', 'environment:runtimes:request-port', requestOptions);
+      const selectedPort = await this.serial.requestPort(requestOptions);
+      emitLog(this.logger, 'log', 'environment:runtimes:port-selected', summarizeSerialPort(selectedPort));
+      ports.unshift(selectedPort);
     }
 
     const uniquePorts = Array.from(new Set(ports));
     this._runtimes = [];
+    const errors = [];
 
-    for (const port of uniquePorts) {
-      this._runtimes.push(await Runtime.connect(port, this.options));
+    for (const [index, port] of uniquePorts.entries()) {
+      emitLog(this.logger, 'log', 'environment:runtimes:connect-port', {
+        index,
+        port: summarizeSerialPort(port),
+      });
+      try {
+        this._runtimes.push(await Runtime.connect(port, this.options));
+      } catch (error) {
+        errors.push(error);
+        emitLog(this.logger, 'warn', 'environment:runtimes:connect-port-failed', {
+          index,
+          port: summarizeSerialPort(port),
+          error,
+        });
+      }
     }
 
+    if (this._runtimes.length === 0 && errors.length > 0) {
+      throw errors[0];
+    }
+
+    emitLog(this.logger, 'log', 'environment:runtimes:complete', {
+      runtimeCount: this._runtimes.length,
+    });
     return this._runtimes;
   }
 
   async disconnect() {
+    emitLog(this.logger, 'log', 'environment:disconnect', {
+      runtimeCount: this._runtimes.length,
+    });
     await Promise.allSettled(this._runtimes.map((runtime) => runtime.disconnect()));
     this._runtimes = [];
   }
@@ -112,26 +212,40 @@ export class UsbEnvironment {
 
 export class Runtime {
   static async connect(existingPort = null, options = {}) {
+    const logger = normalizeLogger(options.logger ?? (options.debug ? console : null));
+    emitLog(logger, 'log', 'runtime:connect:start', {
+      hasExistingPort: Boolean(existingPort),
+      port: summarizeSerialPort(existingPort),
+    });
     const transport = new EnodyTransport(options);
     await transport.connect(existingPort);
+    emitLog(logger, 'log', 'runtime:connect:transport-ready');
 
-    let info = null;
     try {
-      const infoMessage = await transport.sendCommand(Commands.runtimeInfo());
-      info = infoMessage.event.event.data;
-    } catch (error) {
-      // Some older firmware builds may not answer Runtime::Info. Host access
-      // still works, so we only treat this as missing metadata.
-      info = null;
+      emitLog(logger, 'log', 'host:info:request');
+      const hostMessage = await transport.sendCommand(Commands.hostInfo());
+      const hostInfo = hostMessage.event.event.data;
+      emitLog(logger, 'log', 'host:info:response', summarizeDeviceInfo(hostInfo));
+      return new Runtime(transport, hostInfo, { hostInfo });
+    } catch (hostError) {
+      try {
+        const infoMessage = await transport.sendCommand(Commands.runtimeInfo(), null, null, {
+          deviceErrorLogLevel: 'warn',
+        });
+        const info = infoMessage.event.event.data;
+        emitLog(logger, 'log', 'runtime:info:response', summarizeDeviceInfo(info));
+        return new Runtime(transport, info);
+      } catch (runtimeError) {
+        await transport.disconnect();
+        throw hostError;
+      }
     }
-
-    return new Runtime(transport, info);
   }
 
-  constructor(transport, info = null) {
+  constructor(transport, info = null, options = {}) {
     this.transport = transport;
     this._info = info;
-    this._host = null;
+    this._host = options.hostInfo ? new Host(this.transport, options.hostInfo) : null;
   }
 
   identifier() {
@@ -154,14 +268,17 @@ export class Runtime {
     let hostInfo = null;
 
     try {
+      emitLog(this.transport.logger, 'log', 'runtime:host:request');
       const message = await this.transport.sendCommand(Commands.runtimeHost());
       hostInfo = message.event.event.data;
     } catch (error) {
       // The existing EP01 firmware path used by the original JS SDK answers a
       // root Host::Info command even when Runtime::Host is unavailable.
+      emitLog(this.transport.logger, 'log', 'host:info:request');
       const fallbackMessage = await this.transport.sendCommand(Commands.hostInfo());
       hostInfo = fallbackMessage.event.event.data;
     }
+    emitLog(this.transport.logger, 'log', 'host:info:response', summarizeDeviceInfo(hostInfo));
 
     if (!this._info && hostInfo) {
       this._info = {
@@ -458,10 +575,26 @@ export class Source {
 
     const emitters = [];
     for (let index = 0; index < count; index += 1) {
-      const infoMessage = await this.transport.sendCommand(
-        Commands.sourceEmitterInfo(index),
-        this._resourceIdentifier,
-      );
+      let infoMessage = null;
+      try {
+        infoMessage = await this.transport.sendCommand(
+          Commands.sourceEmitterInfo(index),
+          this._resourceIdentifier,
+        );
+      } catch (error) {
+        if (isCommandTimeout(error) && emitters.length > 0) {
+          emitLog(this.transport.logger, 'warn', 'source:emitter-info:timeout-stopping-enumeration', {
+            source: this.identifier(),
+            requestedCount: count,
+            discoveredCount: emitters.length,
+            failedIndex: index,
+            timeoutMs: error.timeoutMs,
+          });
+          break;
+        }
+        throw error;
+      }
+
       emitters.push(new Emitter({
         transport: this.transport,
         info: infoMessage.event.event.data,

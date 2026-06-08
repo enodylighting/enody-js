@@ -7,9 +7,12 @@ import { PostcardEncoder, PostcardDecoder, uuidV4, uuidToString, uuidFromString 
 import { frameBytes, unframeBytes, FrameAccumulator } from '../src/framing.js';
 import {
   Commands,
+  ErrorType,
   buildCommandMessage,
   decodeConfigurationList,
+  describeCommand,
   encodeConfigurationList,
+  errorTypeName,
 } from '../src/message.js';
 
 let passed = 0;
@@ -214,6 +217,28 @@ function assertConfigurationListEq(actual, expected, message) {
   );
   assertEq(cmdBytes[0], 2, 'runtimeSettingSet: Command::Runtime variant');
   assertEq(cmdBytes[1], 5, 'runtimeSettingSet: RuntimeCommand::SettingSet variant');
+}
+
+{
+  const description = describeCommand(Commands.runtimeSettingSet(
+    'dev.enody.configuration-presets',
+    new Uint8Array([0x01, 0x02, 0x03]),
+  ));
+  assertEq(description.name, 'Runtime.SettingSet', 'describeCommand names runtime setting writes');
+  assertEq(description.key, 'dev.enody.configuration-presets', 'describeCommand decodes setting key');
+  assertEq(description.valueByteLength, 3, 'describeCommand reports setting value length');
+}
+
+{
+  const description = describeCommand(Commands.emitterSpectralSampleBatch(8, 24));
+  assertEq(description.name, 'Emitter.SpectralData.SampleBatch', 'describeCommand names spectral batches');
+  assertEq(description.start, 8, 'describeCommand decodes spectral batch start');
+  assertEq(description.end, 24, 'describeCommand decodes spectral batch end');
+}
+
+{
+  assertEq(errorTypeName(ErrorType.Timeout), 'Timeout', 'errorTypeName maps known errors');
+  assertEq(errorTypeName(99), 'ErrorType(99)', 'errorTypeName falls back for unknown errors');
 }
 
 {
