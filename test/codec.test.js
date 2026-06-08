@@ -5,7 +5,12 @@
 
 import { PostcardEncoder, PostcardDecoder, uuidV4, uuidToString, uuidFromString } from '../src/postcard.js';
 import { frameBytes, unframeBytes, FrameAccumulator } from '../src/framing.js';
-import { Commands, buildCommandMessage, decodeMessage } from '../src/message.js';
+import {
+  Commands,
+  buildCommandMessage,
+  decodeConfigurationList,
+  encodeConfigurationList,
+} from '../src/message.js';
 
 let passed = 0;
 let failed = 0;
@@ -29,6 +34,28 @@ function assertEq(a, b, msg) {
     failed++;
     console.error(`FAIL: ${msg} — expected ${JSON.stringify(b)}, got ${JSON.stringify(a)}`);
   }
+}
+
+function assertConfigurationListEq(actual, expected, message) {
+  const equal = actual.length === expected.length && actual.every((configuration, index) => {
+    const candidate = expected[index];
+    if (configuration.type !== candidate.type) {
+      return false;
+    }
+
+    if (configuration.type === 1) {
+      return Math.abs(configuration.kelvin - candidate.kelvin) < 0.01;
+    }
+
+    if (configuration.type === 2) {
+      return Math.abs(configuration.x - candidate.x) < 1e-5
+        && Math.abs(configuration.y - candidate.y) < 1e-5;
+    }
+
+    return true;
+  });
+
+  assert(equal, message);
 }
 
 // --- Varint encoding ---
@@ -172,6 +199,32 @@ function assertEq(a, b, msg) {
   assertEq(cmdBytes[0], 4, 'fixtureDisplay: Command::Fixture variant');
   assertEq(cmdBytes[1], 1, 'fixtureDisplay: FixtureCommand::Display variant');
   assertEq(cmdBytes[2], 1, 'fixtureDisplay: Configuration::Blackbody variant');
+}
+
+{
+  const cmdBytes = Commands.runtimeSettingGet('dev.enody.configuration-presets');
+  assertEq(cmdBytes[0], 2, 'runtimeSettingGet: Command::Runtime variant');
+  assertEq(cmdBytes[1], 4, 'runtimeSettingGet: RuntimeCommand::SettingGet variant');
+}
+
+{
+  const cmdBytes = Commands.runtimeSettingSet(
+    'dev.enody.configuration-presets',
+    new Uint8Array([0x01, 0x02, 0x03]),
+  );
+  assertEq(cmdBytes[0], 2, 'runtimeSettingSet: Command::Runtime variant');
+  assertEq(cmdBytes[1], 5, 'runtimeSettingSet: RuntimeCommand::SettingSet variant');
+}
+
+{
+  const presets = [
+    { type: 1, kelvin: 2700 },
+    { type: 2, x: 0.3127, y: 0.3290 },
+  ];
+  const enc = new PostcardEncoder();
+  encodeConfigurationList(enc, presets);
+  const decoded = decodeConfigurationList(new PostcardDecoder(enc.result()));
+  assertConfigurationListEq(decoded, presets, 'Configuration preset list roundtrip');
 }
 
 {

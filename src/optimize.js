@@ -217,6 +217,43 @@ export function computeEmission(weights, spdMatrix, numEmitters, numWavelengths)
   return emission;
 }
 
+function integrateSpectrumRange(spectrum, startNm, endNmExclusive) {
+  let sum = 0;
+  const start = Math.max(380, startNm);
+  const end = Math.min(781, endNmExclusive);
+  for (let nm = start; nm < end; nm += 1) sum += spectrum[nm - 380];
+  return sum;
+}
+
+function normalizeSpectrumRange(spectrum, startNm, endNmExclusive) {
+  const total = integrateSpectrumRange(spectrum, startNm, endNmExclusive);
+  const normalized = new Float32Array(spectrum.length);
+  if (total <= 0) return normalized;
+  const scale = 1 / total;
+  for (let i = 0; i < spectrum.length; i += 1) normalized[i] = spectrum[i] * scale;
+  return normalized;
+}
+
+export function computePlantBandMetrics(spectrum) {
+  const epar = integrateSpectrumRange(spectrum, 400, 751);
+  const bluePhotons = integrateSpectrumRange(spectrum, 400, 500);
+  const greenPhotons = integrateSpectrumRange(spectrum, 500, 600);
+  const redPhotons = integrateSpectrumRange(spectrum, 600, 700);
+  const farRedPhotons = integrateSpectrumRange(spectrum, 700, 751);
+  const denom = epar || 1;
+  const redFarRed = redPhotons + farRedPhotons;
+
+  return {
+    epar,
+    blue: bluePhotons / denom,
+    green: greenPhotons / denom,
+    red: redPhotons / denom,
+    farRed: farRedPhotons / denom,
+    redBlueRatio: redPhotons / Math.max(bluePhotons, 1e-9),
+    frToRedFarRed: farRedPhotons / Math.max(redFarRed, 1e-9),
+  };
+}
+
 // ─── Adam Optimizer ─────────────────────────────────────────────────────────
 
 export class AdamOptimizer {
@@ -499,6 +536,12 @@ export class SpectralOptimizer {
     // Precomputed per-emitter dot products with color sample (set in setColorBoost)
     this.emitterSampleDots = null;
 
+    // Plant recipe state
+    this.plantTarget = null;
+    this.plantTargetNormalizedSpectrum = null;
+    this.plantMetrics = null;
+    this.targetScore = 0;
+
     // Results
     this.emission = null;
     this.chromaticity = null;
@@ -513,6 +556,10 @@ export class SpectralOptimizer {
     this.mode = 'chromaticity';
     this.targetX = x;
     this.targetY = y;
+    this.plantTarget = null;
+    this.plantTargetNormalizedSpectrum = null;
+    this.plantMetrics = null;
+    this.targetScore = 0;
     if (!keepWeights) this.weights.fill(0.5);
     this.optimizer = new AdamOptimizer(this.numEmitters, lr);
     this.iteration = 0;
@@ -524,6 +571,10 @@ export class SpectralOptimizer {
   setTargetCCT(cctKelvin, lr = 5e-5, keepWeights = false) {
     this.mode = 'cct';
     this.targetCCT = cctKelvin;
+    this.plantTarget = null;
+    this.plantTargetNormalizedSpectrum = null;
+    this.plantMetrics = null;
+    this.targetScore = 0;
     const wavelengths = [];
     for (let i = 0; i < 401; i++) wavelengths.push(380 + i);
     this.refSpectrum = blackbodySpectrum(cctKelvin, wavelengths);
@@ -549,8 +600,53 @@ export class SpectralOptimizer {
     this.mode = 'spectral';
     this.refSpectrum = targetSpectrum;
     this.targetLabel = label;
+    this.plantTarget = null;
+    this.plantTargetNormalizedSpectrum = null;
+    this.targetScore = 0;
+    this.plantMetrics = null;
 
     // Compute reference chromaticity for display
+    const refChrom = computeChromaticity(this.refSpectrum, this.cieX, this.cieY, this.cieZ);
+    this.targetX = refChrom.x;
+    this.targetY = refChrom.y;
+
+    if (!keepWeights) this.weights.fill(0.5);
+    this.optimizer = new AdamOptimizer(this.numEmitters, lr);
+    this.iteration = 0;
+    this.lossHistory = [];
+  }
+
+  /**
+   * Set a plant-specific target recipe using full-range spectral shape and
+   * band-fraction objectives across blue, green, red, and far-red.
+   * @param {object} profile - Plant profile with `spectrum` and `bands`
+   * @param {Float32Array} profile.spectrum - 401-sample target spectrum
+   * @param {{blue:number, green:number, red:number, farRed:number}} profile.bands
+   */
+  setTargetPlantProfile(profile, lr = 8e-4, keepWeights = false) {
+    this.mode = 'plant';
+    this.refSpectrum = profile.spectrum;
+    this.targetLabel = profile.name || profile.id || 'plant';
+
+    const bands = {
+      blue: profile.bands.blue,
+      green: profile.bands.green,
+      red: profile.bands.red,
+      farRed: profile.bands.farRed,
+    };
+    this.plantTarget = {
+      ...profile,
+      bands: {
+        ...bands,
+        redBlueRatio: bands.red / Math.max(bands.blue, 1e-9),
+        frToRedFarRed: bands.farRed / Math.max(bands.red + bands.farRed, 1e-9),
+      },
+    };
+    this.plantTargetNormalizedSpectrum = normalizeSpectrumRange(profile.spectrum, 400, 751);
+    this.plantMetrics = null;
+    this.targetScore = 0;
+
+    // Keep a chromaticity target for visualization only.
     const refChrom = computeChromaticity(this.refSpectrum, this.cieX, this.cieY, this.cieZ);
     this.targetX = refChrom.x;
     this.targetY = refChrom.y;
@@ -574,6 +670,10 @@ export class SpectralOptimizer {
     this.colorSampleReflectance = sampleReflectance;
     this.targetX = targetX;
     this.targetY = targetY;
+    this.plantTarget = null;
+    this.plantTargetNormalizedSpectrum = null;
+    this.plantMetrics = null;
+    this.targetScore = 0;
 
     // Precompute per-emitter dot products with the color sample
     this.emitterSampleDots = new Float32Array(this.numEmitters);
@@ -640,6 +740,13 @@ export class SpectralOptimizer {
       for (let i = 0; i < this.numEmitters; i++) {
         grads[i] = this.ssiWeight * ssiResult.grads[i] + this.chromWeight * chromResult.grads[i];
       }
+    } else if (this.mode === 'plant') {
+      const result = this._plantLossAndGrad();
+      this.loss = result.loss;
+      this.ssiScore = result.score;
+      this.targetScore = result.score;
+      this.plantMetrics = result.metrics;
+      grads = result.grads;
     } else {
       // CCT mode: chromaticity + SSI losses
       // SSI loss targets the exact targetSSI value: loss = |SSI - targetSSI|
@@ -744,6 +851,49 @@ export class SpectralOptimizer {
     return { loss: baseLoss, grads, ssi: baseSsi };
   }
 
+  _computePlantObjective(emission) {
+    const normalizedEmission = normalizeSpectrumRange(emission, 400, 751);
+    let shapeLoss = 0;
+    for (let nm = 400; nm <= 750; nm += 1) {
+      const idx = nm - 380;
+      const diff = normalizedEmission[idx] - this.plantTargetNormalizedSpectrum[idx];
+      const weight = nm >= 700 ? 1.6 : 1.0;
+      shapeLoss += weight * Math.abs(diff);
+    }
+
+    const metrics = computePlantBandMetrics(emission);
+    const target = this.plantTarget.bands;
+    const bandLoss =
+      2.0 * Math.abs(metrics.blue - target.blue) +
+      1.5 * Math.abs(metrics.green - target.green) +
+      2.0 * Math.abs(metrics.red - target.red) +
+      3.0 * Math.abs(metrics.farRed - target.farRed);
+    const ratioLoss =
+      Math.abs(metrics.redBlueRatio - target.redBlueRatio) / Math.max(target.redBlueRatio, 0.25) +
+      2.0 * Math.abs(metrics.frToRedFarRed - target.frToRedFarRed);
+    const loss = 0.55 * shapeLoss + 2.5 * bandLoss + 1.5 * ratioLoss;
+    const score = Math.max(0, 100 - 35 * (0.75 * shapeLoss + bandLoss + ratioLoss));
+
+    return { loss, score, metrics };
+  }
+
+  _plantLossAndGrad() {
+    const eps = 1e-4;
+    const base = this._computePlantObjective(this.emission);
+    const grads = new Float32Array(this.numEmitters);
+
+    for (let i = 0; i < this.numEmitters; i += 1) {
+      const origW = this.weights[i];
+      this.weights[i] = origW + eps;
+      const pertEmission = computeEmission(this.weights, this.spdMatrix, this.numEmitters, 401);
+      const pert = this._computePlantObjective(pertEmission);
+      grads[i] = (pert.loss - base.loss) / eps;
+      this.weights[i] = origW;
+    }
+
+    return { loss: base.loss, grads, score: base.score, metrics: base.metrics };
+  }
+
   /** Get current optimizer state for visualization. */
   getState() {
     return {
@@ -753,11 +903,13 @@ export class SpectralOptimizer {
       chromaticity: this.chromaticity ? { x: this.chromaticity.x, y: this.chromaticity.y } : null,
       loss: this.loss,
       ssiScore: this.ssiScore,
+      targetScore: this.targetScore,
       mode: this.mode,
       targetX: this.targetX,
       targetY: this.targetY,
       targetCCT: this.targetCCT,
       refSpectrum: this.refSpectrum,
+      plantMetrics: this.plantMetrics,
     };
   }
 }

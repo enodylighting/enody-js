@@ -74,6 +74,22 @@ export function decodeConfiguration(dec) {
   }
 }
 
+export function encodeConfigurationList(enc, configurations) {
+  enc.varint(configurations.length);
+  for (const configuration of configurations) {
+    encodeConfiguration(enc, configuration);
+  }
+}
+
+export function decodeConfigurationList(dec) {
+  const count = dec.varint();
+  const configurations = [];
+  for (let index = 0; index < count; index += 1) {
+    configurations.push(decodeConfiguration(dec));
+  }
+  return configurations;
+}
+
 // --- Flux ---
 
 export const FluxType = { Relative: 0 };
@@ -220,7 +236,15 @@ export const CommandType = {
 };
 
 export const HostCmd = { Info: 0, FixtureCount: 1, FixtureInfo: 2 };
-export const RuntimeCmd = { Info: 0, Host: 1, EnvironmentCount: 2, EnvironmentInfo: 3 };
+export const RuntimeCmd = {
+  Info: 0,
+  Host: 1,
+  EnvironmentCount: 2,
+  EnvironmentInfo: 3,
+  SettingGet: 4,
+  SettingSet: 5,
+  SettingDelete: 6,
+};
 export const FixtureCmd = { Info: 0, Display: 1, SourceCount: 2, SourceInfo: 3 };
 export const SourceCmd = { Info: 0, Display: 1, EmitterCount: 2, EmitterInfo: 3 };
 export const EmitterCmd = { Info: 0, FluxRange: 1, FluxSet: 2, SpectralData: 3 };
@@ -240,11 +264,25 @@ export const EventType = {
 };
 
 export const HostEvt = { Info: 0, FixtureCount: 1, FixtureInfo: 2 };
-export const RuntimeEvt = { Info: 0, Log: 1, Host: 2, EnvironmentCount: 3, EnvironmentInfo: 4 };
+export const RuntimeEvt = {
+  Info: 0,
+  Log: 1,
+  Host: 2,
+  EnvironmentCount: 3,
+  EnvironmentInfo: 4,
+  SettingGet: 5,
+  SettingSet: 6,
+  SettingDelete: 7,
+};
 export const FixtureEvt = { Info: 0, Display: 1, SourceCount: 2, SourceInfo: 3 };
 export const SourceEvt = { Info: 0, Display: 1, EmitterCount: 2, EmitterInfo: 3 };
 export const EmitterEvt = { Info: 0, FluxRange: 1, FluxSet: 2, SpectralData: 3 };
 export const SpectralDataEvt = { Info: 0, Domain: 1, SampleCount: 2, Sample: 3, SampleBatch: 4 };
+export const StoredSettingType = {
+  Missing: 0,
+  Public: 1,
+  Private: 2,
+};
 
 // --- Error decoding ---
 
@@ -309,6 +347,16 @@ export const Commands = {
   // Runtime commands
   runtimeInfo: () => encodeCommand(CommandType.Runtime, RuntimeCmd.Info),
   runtimeHost: () => encodeCommand(CommandType.Runtime, RuntimeCmd.Host),
+  runtimeSettingGet: (key) => encodeCommand(CommandType.Runtime, RuntimeCmd.SettingGet, (e) => {
+    e.string(key);
+  }),
+  runtimeSettingSet: (key, value) => encodeCommand(CommandType.Runtime, RuntimeCmd.SettingSet, (e) => {
+    e.string(key);
+    e.bytes(value);
+  }),
+  runtimeSettingDelete: (key) => encodeCommand(CommandType.Runtime, RuntimeCmd.SettingDelete, (e) => {
+    e.string(key);
+  }),
 
   // Fixture commands
   fixtureInfo: () => encodeCommand(CommandType.Fixture, FixtureCmd.Info),
@@ -420,7 +468,31 @@ function decodeRuntimeEvent(dec) {
     case RuntimeEvt.Host: return { type: 'host', data: decodeHostInfo(dec) };
     case RuntimeEvt.EnvironmentCount: return { type: 'environmentCount', count: dec.u32() };
     case RuntimeEvt.EnvironmentInfo: return { type: 'environmentInfo', data: decodeEnvironmentInfo(dec) };
+    case RuntimeEvt.SettingGet:
+      return {
+        type: 'settingGet',
+        key: dec.string(),
+        setting: decodeStoredSetting(dec),
+      };
+    case RuntimeEvt.SettingSet:
+      return { type: 'settingSet', key: dec.string() };
+    case RuntimeEvt.SettingDelete:
+      return { type: 'settingDelete', key: dec.string() };
     default: throw new Error(`Unknown RuntimeEvent variant: ${v}`);
+  }
+}
+
+function decodeStoredSetting(dec) {
+  const variant = dec.enumVariant();
+  switch (variant) {
+    case StoredSettingType.Missing:
+      return { type: 'missing' };
+    case StoredSettingType.Public:
+      return { type: 'public', bytes: dec.bytes() };
+    case StoredSettingType.Private:
+      return { type: 'private' };
+    default:
+      throw new Error(`Unknown StoredSetting variant: ${variant}`);
   }
 }
 

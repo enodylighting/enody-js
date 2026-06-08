@@ -90,6 +90,21 @@ await fixtures[0].setChromaticity(0.3127, 0.3290, 0.8);
 await fixtures[0].setManual(1.0);
 ```
 
+### Manage stored appearance presets
+
+```js
+import { Configuration } from 'enody';
+
+const presets = await runtime.configurationPresets();
+
+presets.push(Configuration.blackbody(2700));
+
+await runtime.setConfigurationPresets(presets);
+```
+
+`runtime.configurationPresets()` reads the same runtime setting used by the
+Rust host tooling for EP01 appearance presets.
+
 ### Work offline with bundled sample data
 
 ```js
@@ -167,6 +182,7 @@ Key exports:
 
 - `UsbEnvironment`, `Runtime`, `Host`, `Fixture`, `Source`, `Emitter`
 - `Configuration`, `Flux`, `Version`
+- `CONFIGURATION_PRESETS_KEY`
 - `sampleFixture`, `sampleSource`, `sampleEmitter`
 - `SpectralOptimizer`, `GPUCompute`, `computeChromaticity`, `computeSSI`
 - `UpdateTarget`, `ESPFlasher`

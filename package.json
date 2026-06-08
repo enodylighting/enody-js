@@ -26,7 +26,12 @@
     "README.md",
     "LICENSE"
   ],
-  "sideEffects": false,
+  "sideEffects": [
+    "./src/browser/index.js",
+    "./src/node/index.js",
+    "./src/browser/update-entry.js",
+    "./src/node/update-entry.js"
+  ],
   "scripts": {
     "test": "node test/codec.test.js && node test/reference.test.js && node test/interface.test.js && node test/optimizer.test.js",
     "test:hil": "node test/hil.test.js"

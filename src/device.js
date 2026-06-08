@@ -13,13 +13,16 @@ import {
   Commands,
   Configuration,
   Flux,
+  decodeConfigurationList,
+  encodeConfigurationList,
 } from './message.js';
-import { uuidToString } from './postcard.js';
+import { PostcardDecoder, PostcardEncoder, uuidToString } from './postcard.js';
 import { EnodyTransport, EP01_USB_FILTER } from './transport.js';
 import { SpectralData } from './colorimetry.js';
 import { getDefaultSerialProvider } from './serial-provider-registry.js';
 
 const SPECTRAL_BATCH_SIZE = 32;
+export const CONFIGURATION_PRESETS_KEY = 'dev.enody.configuration-presets';
 
 function defaultLogListener(logEvent) {
   const level = (logEvent.levelName || 'info').toLowerCase();
@@ -169,6 +172,79 @@ export class Runtime {
 
     this._host = new Host(this.transport, hostInfo);
     return this._host;
+  }
+
+  async settingGetBytes(key) {
+    const message = await this.transport.sendCommand(Commands.runtimeSettingGet(key));
+    const event = message.event.event;
+
+    if (event.type !== 'settingGet' || event.key !== key) {
+      throw new Error('Unexpected response while reading runtime setting');
+    }
+
+    if (event.setting.type === 'public') {
+      return event.setting.bytes;
+    }
+
+    return null;
+  }
+
+  async settingSetBytes(key, value) {
+    const message = await this.transport.sendCommand(Commands.runtimeSettingSet(key, value));
+    const event = message.event.event;
+
+    if (event.type !== 'settingSet' || event.key !== key) {
+      throw new Error('Unexpected response while writing runtime setting');
+    }
+  }
+
+  async settingDelete(key) {
+    const message = await this.transport.sendCommand(Commands.runtimeSettingDelete(key));
+    const event = message.event.event;
+
+    if (event.type !== 'settingDelete' || event.key !== key) {
+      throw new Error('Unexpected response while deleting runtime setting');
+    }
+  }
+
+  async settingGet(key, decodeValue) {
+    const bytes = await this.settingGetBytes(key);
+    if (bytes === null) {
+      return null;
+    }
+
+    const decoder = new PostcardDecoder(bytes);
+    return decodeValue(decoder);
+  }
+
+  async settingSet(key, value, encodeValue) {
+    const encoder = new PostcardEncoder();
+    encodeValue(encoder, value);
+    await this.settingSetBytes(key, encoder.result());
+  }
+
+  async configurationPresets() {
+    return this.getConfigurationPresets();
+  }
+
+  async getConfigurationPresets() {
+    const bytes = await this.settingGetBytes(CONFIGURATION_PRESETS_KEY);
+    if (bytes === null) {
+      return [];
+    }
+
+    return decodeConfigurationList(new PostcardDecoder(bytes));
+  }
+
+  async setConfigurationPresets(configurations) {
+    if (!configurations.length) {
+      await this.settingDelete(CONFIGURATION_PRESETS_KEY);
+      return;
+    }
+
+    const encoder = new PostcardEncoder();
+    encodeConfigurationList(encoder, configurations);
+    await this.settingSetBytes(CONFIGURATION_PRESETS_KEY, encoder.result());
   }
 
   isConnected() {

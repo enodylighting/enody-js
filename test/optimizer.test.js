@@ -12,6 +12,7 @@ import {
   cieZAction,
   computeChromaticity,
   computeEmission,
+  computePlantBandMetrics,
   computeSSI,
   sampleFixture,
 } from '../src/index.js';
@@ -85,6 +86,59 @@ const response = {
   const emission = computeEmission(new Float32Array([0.5, 0.5]), spd, 2, 401);
   assertClose(emission[500 - 380], 0.5 + 1e-9, 1e-6, 'Emission at 500nm');
   assertClose(emission[600 - 380], 0.5 + 1e-9, 1e-6, 'Emission at 600nm');
+}
+
+// --- Plant recipe optimization should include far-red ---
+{
+  const numEmitters = 4;
+  const spdMatrix = new Float32Array(numEmitters * 401);
+  const emitters = [
+    { center: 450, sigma: 16 },
+    { center: 540, sigma: 28 },
+    { center: 660, sigma: 18 },
+    { center: 730, sigma: 16 },
+  ];
+
+  for (let emitterIndex = 0; emitterIndex < emitters.length; emitterIndex += 1) {
+    for (let wavelengthIndex = 0; wavelengthIndex < 401; wavelengthIndex += 1) {
+      const wavelength = 380 + wavelengthIndex;
+      const z = (wavelength - emitters[emitterIndex].center) / emitters[emitterIndex].sigma;
+      spdMatrix[emitterIndex * 401 + wavelengthIndex] = Math.exp(-0.5 * z * z);
+    }
+  }
+
+  const targetWeights = new Float32Array([0.14, 0.18, 0.41, 0.27]);
+  const targetSpectrum = computeEmission(targetWeights, spdMatrix, numEmitters, 401);
+  const targetBands = computePlantBandMetrics(targetSpectrum);
+
+  const optimizer = new SpectralOptimizer({
+    spdMatrix,
+    numEmitters,
+    cieX: response.cieX,
+    cieY: response.cieY,
+    cieZ: response.cieZ,
+    gpu: null,
+  });
+
+  optimizer.setTargetPlantProfile({
+    name: 'synthetic-plant',
+    spectrum: targetSpectrum,
+    bands: {
+      blue: targetBands.blue,
+      green: targetBands.green,
+      red: targetBands.red,
+      farRed: targetBands.farRed,
+    },
+  }, 0.03);
+
+  for (let index = 0; index < 500; index += 1) optimizer.step();
+
+  const state = optimizer.getState();
+  const resultBands = computePlantBandMetrics(state.emission);
+  assert(state.loss < 0.2, `Plant loss < 0.2 after 500 iter: ${state.loss.toExponential(3)}`);
+  assert(state.targetScore > 85, `Plant target score > 85: ${state.targetScore.toFixed(1)}`);
+  assertClose(resultBands.farRed, targetBands.farRed, 0.03, `Far-red fraction ≈ ${targetBands.farRed.toFixed(3)}`);
+  assertClose(resultBands.red, targetBands.red, 0.03, `Red fraction ≈ ${targetBands.red.toFixed(3)}`);
 }
 
 // --- Adam optimizer convergence ---

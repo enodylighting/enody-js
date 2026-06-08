@@ -10,6 +10,7 @@ export {
   Fixture,
   Source,
   Emitter,
+  CONFIGURATION_PRESETS_KEY,
 } from './device.js';
 export { Chromaticity, XYZ, SpectralData, SpectralSample } from './colorimetry.js';
 export { EnodyTransport, EP01_USB_FILTER } from './transport.js';
@@ -20,8 +21,11 @@ export {
   ConfigurationType,
   Flux,
   FluxType,
+  StoredSettingType,
   Version,
   compareVersions,
+  decodeConfigurationList,
+  encodeConfigurationList,
 } from './message.js';
 export {
   sampleFixture,
@@ -46,6 +50,7 @@ export {
   computeSSI,
   computeChromaticity,
   computeEmission,
+  computePlantBandMetrics,
   melanopicResponse,
   rhodopicResponse,
   sConeResponse,

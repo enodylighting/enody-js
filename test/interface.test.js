@@ -4,6 +4,8 @@
  */
 
 import {
+  CONFIGURATION_PRESETS_KEY,
+  Configuration,
   Emitter,
   Fixture,
   Runtime,
@@ -15,6 +17,8 @@ import {
   sampleFixtureJson,
   sampleSource,
 } from '../src/index.js';
+import { decodeConfigurationList, encodeConfigurationList } from '../src/message.js';
+import { PostcardDecoder, PostcardEncoder } from '../src/postcard.js';
 
 let passed = 0;
 let failed = 0;
@@ -26,6 +30,28 @@ function assert(condition, message) {
     failed++;
     console.error(`FAIL: ${message}`);
   }
+}
+
+function assertConfigurationListEq(actual, expected, message) {
+  const equal = actual.length === expected.length && actual.every((configuration, index) => {
+    const candidate = expected[index];
+    if (configuration.type !== candidate.type) {
+      return false;
+    }
+
+    if (configuration.type === 1) {
+      return Math.abs(configuration.kelvin - candidate.kelvin) < 0.01;
+    }
+
+    if (configuration.type === 2) {
+      return Math.abs(configuration.x - candidate.x) < 1e-5
+        && Math.abs(configuration.y - candidate.y) < 1e-5;
+    }
+
+    return true;
+  });
+
+  assert(equal, message);
 }
 
 const fixtureJson = sampleFixtureJson();
@@ -115,6 +141,84 @@ function spectralMeasurementsFromJson(spectralDataJson) {
   assert(hostInfoAttempts === 1, 'Runtime.host falls back to Host::Info');
   assert(host.identifier() === hostInfo.identifier, 'Runtime host fallback returns host info');
   assert(host.versionString === '1.2.3', 'Runtime host fallback preserves version');
+}
+
+// --- Runtime configuration presets ---
+{
+  const expectedPresets = [
+    Configuration.blackbody(2700),
+    Configuration.chromatic(0.3127, 0.3290),
+  ];
+  const presetBytes = new PostcardEncoder();
+  encodeConfigurationList(presetBytes, expectedPresets);
+  let savedPresetBytes = null;
+  let deleteKey = null;
+
+  const runtime = new Runtime({
+    connected: true,
+    async sendCommand(commandBytes) {
+      if (commandBytes[0] === 2 && commandBytes[1] === 4) {
+        return {
+          event: {
+            event: {
+              type: 'settingGet',
+              key: CONFIGURATION_PRESETS_KEY,
+              setting: {
+                type: 'public',
+                bytes: presetBytes.result(),
+              },
+            },
+          },
+        };
+      }
+
+      if (commandBytes[0] === 2 && commandBytes[1] === 5) {
+        const decoder = new PostcardDecoder(commandBytes.slice(2));
+        const key = decoder.string();
+        savedPresetBytes = decoder.bytes();
+        return {
+          event: {
+            event: {
+              type: 'settingSet',
+              key,
+            },
+          },
+        };
+      }
+
+      if (commandBytes[0] === 2 && commandBytes[1] === 6) {
+        const decoder = new PostcardDecoder(commandBytes.slice(2));
+        deleteKey = decoder.string();
+        return {
+          event: {
+            event: {
+              type: 'settingDelete',
+              key: deleteKey,
+            },
+          },
+        };
+      }
+
+      throw new Error(`Unexpected command ${Array.from(commandBytes).join(',')}`);
+    },
+  });
+
+  const presets = await runtime.configurationPresets();
+  assertConfigurationListEq(
+    presets,
+    expectedPresets,
+    'Runtime.configurationPresets loads stored configurations',
+  );
+
+  await runtime.setConfigurationPresets(expectedPresets);
+  assertConfigurationListEq(
+    decodeConfigurationList(new PostcardDecoder(savedPresetBytes)),
+    expectedPresets,
+    'Runtime.setConfigurationPresets stores postcard-encoded configuration lists',
+  );
+
+  await runtime.setConfigurationPresets([]);
+  assert(deleteKey === CONFIGURATION_PRESETS_KEY, 'Runtime.setConfigurationPresets([]) deletes the preset setting');
 }
 
 console.log(`\nResults: ${passed} passed, ${failed} failed`);
