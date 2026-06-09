@@ -52,6 +52,17 @@ function assert(condition, message) {
   }
 }
 
+function fakePort() {
+  return {
+    getInfo() {
+      return {
+        usbVendorId: 0x303a,
+        usbProductId: 0x1001,
+      };
+    },
+  };
+}
+
 function assertConfigurationListEq(actual, expected, message) {
   const equal = actual.length === expected.length && actual.every((configuration, index) => {
     const candidate = expected[index];
@@ -506,6 +517,38 @@ function spectralMeasurementsFromJson(spectralDataJson) {
   }
 
   assert(failedAsExpected, 'UpdateTarget.flashFirmwareImage requires an explicit offset');
+}
+
+// --- Recovery targets can look up firmware by cached host identifier ---
+{
+  const hostId = '87654321-4321-4321-4321-cba987654321';
+  const requests = [];
+  const fetchImpl = async (url) => {
+    requests.push(url);
+    return {
+      ok: true,
+      json: async () => [
+        { version: '2.0.0', payload: [{ offset: 0x20000, length: 0, data: 'app.bin' }] },
+      ],
+    };
+  };
+
+  const target = UpdateTarget.fromRecoveryPort(fakePort(), {
+    hostIdentifier: hostId,
+    hostVersion: 'unknown',
+    baseUrl: 'https://firmware.example',
+    fetch: fetchImpl,
+    serial: {
+      getPorts: async () => [],
+      requestPort: async () => fakePort(),
+    },
+  });
+
+  const versions = await target.availableFirmware();
+
+  assert(target.identifier() === hostId, 'UpdateTarget recovery mode uses cached host identifier');
+  assert(versions[0] === '2.0.0', 'UpdateTarget recovery mode fetches firmware manifest');
+  assert(requests[0].endsWith(`/${hostId}/firmware.json`), 'UpdateTarget recovery mode uses cached host identifier in manifest URL');
 }
 
 console.log(`\nResults: ${passed} passed, ${failed} failed`);

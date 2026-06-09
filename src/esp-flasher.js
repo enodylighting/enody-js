@@ -1,597 +1,1076 @@
 /**
- * ESP32 ROM Bootloader Flasher — Vanilla JS implementation.
+ * Compatibility adapter around esptool-js for EP01 firmware flashing.
  *
- * Minimal, readable implementation of the ESP ROM bootloader serial protocol
- * for flashing firmware to ESP32-C6 devices in Secure Download Mode (SDM).
- *
- * This replaces the minified esptool-bundle.js with a focused, self-contained
- * module that supports only the operations needed for EP01 firmware updates:
- *
- *   - SLIP framing (Serial Line Internet Protocol)
- *   - ROM bootloader sync & chip detection
- *   - Secure Download Mode detection via GET_SECURITY_INFO
- *   - SPI flash attach & parameter configuration
- *   - Uncompressed flash writes (compressed writes are blocked in SDM)
- *   - USB JTAG reset sequence (for ESP32-C6 USB serial)
- *
- * Protocol reference: Espressif ESP32 Technical Reference Manual, Chapter 2
- * (ROM Bootloader Protocol). See also: esptool.py and esptool-js.
+ * esptool-js is pinned as an SDK dependency. The package bundle avoids the
+ * extensionless internal imports in esptool-js/lib when loaded by Node ESM.
  */
 
-// ─── SLIP Protocol ──────────────────────────────────────────────────────────
-//
-// SLIP (RFC 1055) is used to frame packets over the serial link.
-// Each packet is delimited by 0xC0 bytes. Within a packet:
-//   - 0xC0 is escaped as [0xDB, 0xDC]
-//   - 0xDB is escaped as [0xDB, 0xDD]
+import { ESPLoader, Transport } from 'esptool-js/bundle.js';
 
-const SLIP_END = 0xc0;
-const SLIP_ESC = 0xdb;
-const SLIP_ESC_END = 0xdc;
-const SLIP_ESC_ESC = 0xdd;
+export const DEFAULT_INITIAL_BAUDRATE = 115200;
+export const DEFAULT_FLASH_BAUDRATE = null;
+export const EP01_FLASH_SIZE_BYTES = 8 * 1024 * 1024;
+export const EP01_FLASH_SIZE = '8MB';
+export const DEFAULT_FLASH_SIZE = EP01_FLASH_SIZE_BYTES;
+export const FLASH_SECTOR_SIZE = 0x1000;
+export const WATCHDOG_FEED_BLOCK_INTERVAL = 128;
+export const FLASH_ALIGNMENT_BYTES = 4;
+export const FLASH_PADDING_BYTE = 0xff;
 
-function slipEncode(data) {
-  const out = [SLIP_END];
-  for (const byte of data) {
-    if (byte === SLIP_END) out.push(SLIP_ESC, SLIP_ESC_END);
-    else if (byte === SLIP_ESC) out.push(SLIP_ESC, SLIP_ESC_ESC);
-    else out.push(byte);
-  }
-  out.push(SLIP_END);
-  return new Uint8Array(out);
+const CHIP_NAME_ESP32_C6 = 'ESP32-C6';
+const WDT_WKEY = 0x50d83aa1;
+const ESP32_C6_LP_WDT_BASE = 0x600b1c00;
+const ESP32_C6_LP_WDT_CONFIG0_REG = ESP32_C6_LP_WDT_BASE + 0x00;
+const ESP32_C6_LP_WDT_FEED_REG = ESP32_C6_LP_WDT_BASE + 0x14;
+const ESP32_C6_LP_WDT_WPROTECT_REG = ESP32_C6_LP_WDT_BASE + 0x18;
+const ESP32_C6_LP_WDT_SWD_CONFIG_REG = ESP32_C6_LP_WDT_BASE + 0x1c;
+const ESP32_C6_LP_WDT_SWD_WPROTECT_REG = ESP32_C6_LP_WDT_BASE + 0x20;
+const ESP32_C6_WDT_FEED = 0x80000000;
+const ESP32_C6_SWD_AUTO_FEED_EN = 1 << 18;
+
+function nowMs() {
+  return typeof performance !== 'undefined' && typeof performance.now === 'function'
+    ? performance.now()
+    : Date.now();
 }
 
-function slipDecode(frame) {
-  const out = [];
-  let esc = false;
-  for (const byte of frame) {
-    if (esc) {
-      if (byte === SLIP_ESC_END) out.push(SLIP_END);
-      else if (byte === SLIP_ESC_ESC) out.push(SLIP_ESC);
-      else out.push(byte); // malformed, pass through
-      esc = false;
-    } else if (byte === SLIP_ESC) {
-      esc = true;
-    } else if (byte !== SLIP_END) {
-      out.push(byte);
-    }
+function abortError(signal, operation = 'operation') {
+  const reason = signal?.reason;
+  if (reason instanceof Error) {
+    return reason;
   }
-  return new Uint8Array(out);
+
+  const error = new Error(reason === undefined ? `Operation aborted during ${operation}` : String(reason));
+  error.name = 'AbortError';
+  return error;
 }
 
-// ─── ROM Bootloader Command Opcodes ─────────────────────────────────────────
-
-const CMD = {
-  FLASH_BEGIN:       0x02,
-  FLASH_DATA:        0x03,
-  FLASH_END:         0x04,
-  SYNC:              0x08,
-  SPI_SET_PARAMS:    0x0b,
-  SPI_ATTACH:        0x0d,
-  CHANGE_BAUDRATE:   0x0f,
-  GET_SECURITY_INFO: 0x14,
-};
-
-const CMD_NAMES = Object.fromEntries(
-  Object.entries(CMD).map(([name, value]) => [value, name]),
-);
-
-// ─── Constants ──────────────────────────────────────────────────────────────
-
-const CHECKSUM_MAGIC = 0xef;
-const DEFAULT_TIMEOUT = 3000;        // 3 seconds
-const SYNC_TIMEOUT = 100;            // 100ms per sync attempt
-const FLASH_WRITE_SIZE = 0x400;      // 1KB blocks (ROM bootloader, no stub)
-const ERASE_WRITE_TIMEOUT_PER_MB = 40000;
-
-// ESP32-C6 chip ID as returned by GET_SECURITY_INFO
-const CHIP_ID_ESP32_C6 = 13;
-
-// Chip ID → name mapping (subset relevant for EP01)
-const CHIP_NAMES = {
-  0: 'ESP32', 2: 'ESP32-S2', 5: 'ESP32-C3', 9: 'ESP32-S3',
-  12: 'ESP32-C2', 13: 'ESP32-C6', 16: 'ESP32-H2', 17: 'ESP32-C5',
-  18: 'ESP32-P4', 20: 'ESP32-C61',
-};
-
-// ─── Utility: Little-endian byte packing ────────────────────────────────────
-
-function packU16(value) {
-  return [value & 0xff, (value >> 8) & 0xff];
-}
-
-function packU32(value) {
-  return [value & 0xff, (value >> 8) & 0xff, (value >> 16) & 0xff, (value >> 24) & 0xff];
-}
-
-function unpackU32(data, offset = 0) {
-  return (data[offset] | (data[offset + 1] << 8) |
-          (data[offset + 2] << 16) | (data[offset + 3] << 24)) >>> 0;
-}
-
-function checksum(data) {
-  let cs = CHECKSUM_MAGIC;
-  for (const byte of data) cs ^= byte;
-  return cs;
-}
-
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-// ─── Serial Transport ───────────────────────────────────────────────────────
-//
-// Wraps WebSerial with a buffered reader that extracts SLIP frames.
-
-class SerialTransport {
-  constructor(port) {
-    this.port = port;
-    this.reader = null;
-    this.writer = null;
-    this.buffer = new Uint8Array(0);
-    this._readLoopRunning = false;
-  }
-
-  async open(baudrate = 115200) {
-    await this.port.open({ baudRate: baudrate, dataBits: 8, parity: 'none', stopBits: 1 });
-    this.writer = this.port.writable.getWriter();
-    // Start a continuous background read loop (like esptool-js Transport.readLoop)
-    this._startReadLoop();
-  }
-
-  async close() {
-    this._readLoopRunning = false;
-    try {
-      if (this._bgReader) {
-        await this._bgReader.cancel();
-        this._bgReader.releaseLock();
-      }
-    } catch (e) {}
-    try { if (this.writer) { this.writer.releaseLock(); } } catch (e) {}
-    try { await this.port.close(); } catch (e) {}
-    this._bgReader = null;
-    this.writer = null;
-    this.buffer = new Uint8Array(0);
-  }
-
-  /** Start background read loop that continuously buffers incoming serial data. */
-  _startReadLoop() {
-    this._readLoopRunning = true;
-    this._bgReader = this.port.readable.getReader();
-    const loop = async () => {
-      try {
-        while (this._readLoopRunning) {
-          const { value, done } = await this._bgReader.read();
-          if (done || !this._readLoopRunning) break;
-          if (value && value.length > 0) {
-            const merged = new Uint8Array(this.buffer.length + value.length);
-            merged.set(this.buffer);
-            merged.set(value, this.buffer.length);
-            this.buffer = merged;
-          }
-        }
-      } catch (e) {
-        // Port closed or error — expected during disconnect
-      }
-    };
-    loop(); // Fire and forget
-  }
-
-  async setSignals(signals) {
-    await this.port.setSignals(signals);
-  }
-
-  /** Write raw bytes to serial. */
-  async write(data) {
-    await this.writer.write(data);
-  }
-
-  /** Send a SLIP-encoded packet. */
-  async writeSlip(data) {
-    await this.write(slipEncode(data));
-  }
-
-  /**
-   * Read the next complete SLIP frame from the serial port.
-   * The background read loop continuously fills this.buffer;
-   * we just poll it until a complete frame appears or timeout.
-   */
-  async readSlip(timeout = DEFAULT_TIMEOUT) {
-    const deadline = Date.now() + timeout;
-
-    while (Date.now() < deadline) {
-      const frame = this._extractFrame();
-      if (frame) return slipDecode(frame);
-      // Yield to let the background read loop fill the buffer
-      await sleep(1);
-    }
-
-    throw new Error('Read timeout');
-  }
-
-  /** Extract one complete SLIP frame from the internal buffer. */
-  _extractFrame() {
-    // Find the first SLIP_END that starts a frame
-    let start = -1;
-    for (let i = 0; i < this.buffer.length; i++) {
-      if (this.buffer[i] === SLIP_END) { start = i; break; }
-    }
-    if (start === -1) return null;
-
-    // Find the next SLIP_END that ends the frame (skip consecutive 0xC0s)
-    let end = -1;
-    let inData = false;
-    for (let i = start + 1; i < this.buffer.length; i++) {
-      if (this.buffer[i] !== SLIP_END) inData = true;
-      if (this.buffer[i] === SLIP_END && inData) { end = i; break; }
-    }
-    if (end === -1) return null;
-
-    const frame = this.buffer.slice(start, end + 1);
-    this.buffer = this.buffer.slice(end + 1);
-    return frame;
-  }
-
-  /** Flush any buffered input data. */
-  flush() {
-    this.buffer = new Uint8Array(0);
+function throwIfAborted(signal) {
+  if (signal?.aborted) {
+    throw abortError(signal);
   }
 }
 
-// ─── ESP ROM Bootloader Flasher ─────────────────────────────────────────────
-
-export class ESPFlasher {
-  /**
-   * @param {SerialPort} port - WebSerial port (closed; will be opened)
-   * @param {object} opts
-   * @param {function} opts.log - Log callback: (message: string) => void
-   */
-  constructor(port, opts = {}) {
-    this.transport = new SerialTransport(port);
-    this.log = opts.log || (() => {});
-    this.chipName = null;
-    this.chipId = null;
-    this.secureDownloadMode = false;
+function diagnosticDetail(detail) {
+  if (detail === undefined) {
+    return '';
   }
 
-  // ── High-level API ──────────────────────────────────────────────────────
+  try {
+    return ` ${JSON.stringify(detail)}`;
+  } catch (error) {
+    return ` ${String(detail)}`;
+  }
+}
 
-  /**
-   * Connect to the ROM bootloader, sync, and detect the chip.
-   * Retries the full reset+sync sequence up to 7 times (matching esptool).
-   * Returns the chip name string.
-   */
-  async connect(baudrate = 115200) {
-    await this.transport.open(baudrate);
+function formatUsbId(value) {
+  return value === undefined ? undefined : `0x${value.toString(16).padStart(4, '0')}`;
+}
 
-    // Try reset + sync up to 7 times
-    const MAX_ATTEMPTS = 7;
-    let synced = false;
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-      this.log(`Connection attempt ${attempt}/${MAX_ATTEMPTS}...`);
-
-      // Reset into bootloader via USB JTAG sequence
-      await this._usbJtagReset();
-
-      // Try syncing (5 retries per attempt)
-      if (await this._trySync()) {
-        synced = true;
-        break;
-      }
-    }
-
-    if (!synced) {
-      throw new Error(`Failed to sync with ROM bootloader (${MAX_ATTEMPTS} attempts)`);
-    }
-
-    // Detect chip via GET_SECURITY_INFO
-    this.log('Reading security info...');
-    const secInfo = await this._getSecurityInfo();
-
-    if (secInfo) {
-      this.secureDownloadMode = !!(secInfo.flags & 0x04);
-      this.chipId = secInfo.chipId;
-      this.chipName = CHIP_NAMES[this.chipId] || `Unknown (ID ${this.chipId})`;
-    } else {
-      this.chipName = 'Unknown';
-    }
-
-    this.log(`Chip: ${this.chipName}${this.secureDownloadMode ? ' (Secure Download Mode)' : ''}`);
-
-    if (this.chipId === CHIP_ID_ESP32_C6 || this.secureDownloadMode) {
-      this.log('Configuring SPI flash...');
-      await this._spiAttach();
-      await this._spiSetParams(4 * 1024 * 1024); // 4MB default
-    }
-
-    return this.chipName;
+function summarizePort(port) {
+  let info = null;
+  try {
+    info = typeof port?.getInfo === 'function' ? port.getInfo() : null;
+  } catch (error) {
+    info = { error: error.message };
   }
 
-  /**
-   * Write firmware payloads to flash.
-   * @param {Array<{data: Uint8Array, address: number}>} payloads
-   * @param {function} onProgress - (payloadIndex, bytesWritten, totalBytes) => void
-   */
-  async flash(payloads, onProgress = null) {
-    for (let i = 0; i < payloads.length; i++) {
-      const { data, address } = payloads[i];
-      this.log(`Writing ${data.length} bytes to 0x${address.toString(16)}...`);
-      await this._flashPayload(data, address, (written, total) => {
-        if (onProgress) onProgress(i, written, total);
-      });
-    }
+  return {
+    usbVendorId: formatUsbId(info?.usbVendorId),
+    usbProductId: formatUsbId(info?.usbProductId),
+    readable: Boolean(port?.readable),
+    writable: Boolean(port?.writable),
+  };
+}
+
+function serialPortInfo(port) {
+  try {
+    return typeof port?.getInfo === 'function' ? port.getInfo() : null;
+  } catch (error) {
+    return null;
   }
+}
 
-  /** Send FLASH_END to reboot the device. */
-  async reboot() {
-    this.log('Rebooting...');
-    try {
-      await this._command(CMD.FLASH_END, new Uint8Array(packU32(0)), 0, DEFAULT_TIMEOUT);
-    } catch (e) {
-      // FlashEnd may throw in SDM (digest verification) — safe to ignore
-      this.log('(FlashEnd response ignored — normal in SDM)');
-    }
-  }
-
-  /** Disconnect and close the serial port. */
-  async disconnect() {
-    await this.transport.close();
-  }
-
-  // ── Reset sequence ────────────────────────────────────────────────────
-
-  /**
-   * USB JTAG reset sequence to enter bootloader.
-   * Toggles DTR (IO0) and RTS (EN) to reset the ESP32 into download mode.
-   *
-   * This must match the esptool-js UsbJtagSerialReset exactly.
-   * Signals are set individually (not combined) because the WebSerial
-   * setSignals API on some platforms requires separate calls, and the
-   * esptool workaround re-sends DTR after each RTS change.
-   */
-  async _usbJtagReset() {
-    // esptool-js setRTS(state) internally also calls setDTR(last_dtr_state)
-    // as a Windows workaround. We replicate this by setting signals individually.
-    let dtrState = false;
-
-    const setRTS = async (state) => {
-      await this.transport.setSignals({ requestToSend: state });
-      // Workaround: re-send DTR to force a set-control-line-state request
-      await this.transport.setSignals({ dataTerminalReady: dtrState });
-    };
-    const setDTR = async (state) => {
-      dtrState = state;
-      await this.transport.setSignals({ dataTerminalReady: state });
-    };
-
-    await setRTS(false);
-    await setDTR(false);
-    await sleep(100);
-
-    await setDTR(true);
-    await setRTS(false);
-    await sleep(100);
-
-    await setRTS(true);
-    await setDTR(false);
-    await setRTS(true);
-
-    await sleep(100);
-    await setRTS(false);
-    await setDTR(false);
-
-    // Wait for bootloader to start and print its banner
-    await sleep(500);
-    this.transport.flush();
-  }
-
-  // ── Sync ──────────────────────────────────────────────────────────────
-
-  /**
-   * Try to sync with the bootloader. Returns true if sync succeeded, false otherwise.
-   * Makes 5 attempts with increasing timeouts.
-   */
-  async _trySync() {
-    // SYNC payload: [0x07, 0x07, 0x12, 0x20] + 32 × 0x55
-    const syncData = new Uint8Array(36);
-    syncData[0] = 0x07; syncData[1] = 0x07;
-    syncData[2] = 0x12; syncData[3] = 0x20;
-    for (let i = 4; i < 36; i++) syncData[i] = 0x55;
-
-    for (let attempt = 0; attempt < 5; attempt++) {
-      this.transport.flush();
-      try {
-        await this._command(CMD.SYNC, syncData, 0, SYNC_TIMEOUT);
-        // Read 7 additional sync responses (ROM sends 8 total)
-        for (let i = 0; i < 7; i++) {
-          try { await this._readResponse(CMD.SYNC, SYNC_TIMEOUT); } catch (e) { break; }
-        }
-        this.log('Sync established');
-        return true;
-      } catch (e) {
-        // Retry
-      }
-    }
+function serialPortsMatch(left, right) {
+  if (!left || !right) {
     return false;
   }
 
-  // ── GET_SECURITY_INFO ─────────────────────────────────────────────────
+  if (left === right) {
+    return true;
+  }
 
-  async _getSecurityInfo() {
-    try {
-      const resp = await this._command(CMD.GET_SECURITY_INFO, new Uint8Array(0), 0, DEFAULT_TIMEOUT);
-      if (!resp.data || resp.data.length < 12) return null;
+  const leftInfo = serialPortInfo(left);
+  const rightInfo = serialPortInfo(right);
+  if (!leftInfo || !rightInfo) {
+    return false;
+  }
 
-      const flags = unpackU32(resp.data, 0);
-      let chipId = null;
-      if (resp.data.length >= 16) {
-        chipId = unpackU32(resp.data, 12);
+  return leftInfo.usbVendorId === rightInfo.usbVendorId
+    && leftInfo.usbProductId === rightInfo.usbProductId;
+}
+
+function serialEventTarget(serial) {
+  if (serial?.addEventListener && serial?.removeEventListener) {
+    return serial;
+  }
+
+  const browserSerial = globalThis.navigator?.serial;
+  if (browserSerial?.addEventListener && browserSerial?.removeEventListener) {
+    return browserSerial;
+  }
+
+  return null;
+}
+
+function emitLog(log, message) {
+  if (!log) {
+    return;
+  }
+
+  for (const line of String(message).split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (trimmed) {
+      log(trimmed);
+    }
+  }
+}
+
+function terminalFromLog(log) {
+  return {
+    clean() {},
+    write: (message) => emitLog(log, message),
+    writeLine: (message) => emitLog(log, message),
+  };
+}
+
+function normalizePayload(payload, index) {
+  if (!payload || typeof payload !== 'object') {
+    throw new Error(`Flash payload ${index + 1} is invalid`);
+  }
+
+  if (!(payload.data instanceof Uint8Array)) {
+    throw new Error(`Flash payload ${index + 1} data must be a Uint8Array`);
+  }
+
+  if (!Number.isInteger(payload.address) || payload.address < 0) {
+    throw new Error(`Flash payload ${index + 1} is missing a valid address`);
+  }
+
+  return {
+    data: payload.data,
+    address: payload.address,
+  };
+}
+
+function summarizePayloads(payloads) {
+  return payloads.map((payload, index) => ({
+    index,
+    address: `0x${payload.address.toString(16)}`,
+    byteLength: payload.data.length,
+  }));
+}
+
+export function roundEraseSizeToSectors(size, sectorSize = FLASH_SECTOR_SIZE) {
+  if (!Number.isInteger(size) || size < 0) {
+    throw new Error(`Invalid erase size: ${size}`);
+  }
+
+  if (!Number.isInteger(sectorSize) || sectorSize <= 0) {
+    throw new Error(`Invalid sector size: ${sectorSize}`);
+  }
+
+  return Math.ceil(size / sectorSize) * sectorSize;
+}
+
+export function createEp01FlashOptions(fileArray, reportProgress, overrides = {}) {
+  return {
+    fileArray,
+    flashMode: overrides.flashMode ?? 'keep',
+    flashFreq: overrides.flashFreq ?? 'keep',
+    flashSize: overrides.flashSize ?? EP01_FLASH_SIZE,
+    eraseAll: false,
+    compress: false,
+    reportProgress,
+  };
+}
+
+function padTo(data, alignment, padCharacter = FLASH_PADDING_BYTE) {
+  if (!Number.isInteger(alignment) || alignment <= 0) {
+    throw new Error(`Invalid flash alignment: ${alignment}`);
+  }
+
+  const padding = data.length % alignment;
+  if (padding === 0) {
+    return data;
+  }
+
+  const padded = new Uint8Array(data.length + alignment - padding);
+  padded.fill(padCharacter);
+  padded.set(data);
+  return padded;
+}
+
+function timeoutPerMb(loader, secondsPerMb, sizeBytes) {
+  if (typeof loader.timeoutPerMb === 'function') {
+    return loader.timeoutPerMb(secondsPerMb, sizeBytes);
+  }
+
+  return Math.max(3000, secondsPerMb * (sizeBytes / 1000000));
+}
+
+function flashBlockTimeout(loader) {
+  return timeoutPerMb(
+    loader,
+    loader.ERASE_WRITE_TIMEOUT_PER_MB ?? 40000,
+    loader.FLASH_WRITE_SIZE,
+  );
+}
+
+function payloadSignature(payloads) {
+  return payloads
+    .map((payload) => `${payload.address}:${payload.data.length}`)
+    .join('|');
+}
+
+function sectorAlignedResumeOffset(address, resumeOffset, blockSize) {
+  const alignedAddress = Math.max(
+    address,
+    Math.floor((address + resumeOffset) / FLASH_SECTOR_SIZE) * FLASH_SECTOR_SIZE,
+  );
+  const alignedOffset = alignedAddress - address;
+  return Math.floor(alignedOffset / blockSize) * blockSize;
+}
+
+export function isSerialDisconnectError(error) {
+  const text = `${error?.name ?? ''} ${error?.message ?? error ?? ''}`.toLowerCase();
+  return text.includes('device has been lost')
+    || text.includes('serial data stream stopped')
+    || text.includes('no serial data received')
+    || text.includes('networkerror')
+    || text.includes('port is closed')
+    || text.includes('port lost')
+    || text.includes('disconnected')
+    || text.includes('disconnect');
+}
+
+export class SerialPortLostError extends Error {
+  constructor(message, options = {}) {
+    super(message, { cause: options.cause });
+    this.name = 'SerialPortLostError';
+    this.cause = options.cause;
+    this.serialPortLost = true;
+  }
+}
+
+export class FlashProgressTracker {
+  constructor(payloads = []) {
+    this.payloads = [];
+    this.blockSize = null;
+    this.signature = null;
+    this.finished = false;
+
+    if (payloads.length > 0) {
+      this.payloads = payloads.map((payload, index) => ({
+        index,
+        address: payload.address,
+        byteLength: payload.data.length,
+        paddedLength: payload.data.length,
+        totalBlocks: 0,
+        ackedBlocks: 0,
+      }));
+      this.signature = payloadSignature(payloads);
+    }
+  }
+
+  prepare(payloads, blockSize) {
+    if (!Number.isInteger(blockSize) || blockSize <= 0) {
+      throw new Error(`Invalid flash block size: ${blockSize}`);
+    }
+
+    const signature = payloadSignature(payloads);
+    if (this.blockSize !== null) {
+      if (this.blockSize !== blockSize || this.signature !== signature) {
+        throw new Error('Flash progress tracker cannot resume a different payload stream');
+      }
+      return;
+    }
+
+    this.blockSize = blockSize;
+    this.signature = signature;
+    this.payloads = payloads.map((payload, index) => {
+      const paddedLength = padTo(payload.data, FLASH_ALIGNMENT_BYTES).length;
+      return {
+        index,
+        address: payload.address,
+        byteLength: payload.data.length,
+        paddedLength,
+        totalBlocks: Math.ceil(paddedLength / blockSize),
+        ackedBlocks: 0,
+      };
+    });
+  }
+
+  payloadState(index) {
+    const state = this.payloads[index];
+    if (!state) {
+      throw new Error(`Unknown flash payload index ${index}`);
+    }
+    return state;
+  }
+
+  payloadWritten(index) {
+    const state = this.payloadState(index);
+    if (state.byteLength === 0) {
+      return 0;
+    }
+    return Math.min(state.ackedBlocks * this.blockSize, state.byteLength);
+  }
+
+  acknowledgeBlock(payloadIndex, blockIndex) {
+    const state = this.payloadState(payloadIndex);
+    if (blockIndex < state.ackedBlocks) {
+      return;
+    }
+    if (blockIndex !== state.ackedBlocks) {
+      throw new Error(
+        `Cannot ACK flash block ${blockIndex} before block ${state.ackedBlocks} for payload ${payloadIndex}`,
+      );
+    }
+    state.ackedBlocks += 1;
+  }
+
+  rollbackPayload(payloadIndex, ackedBlocks) {
+    const state = this.payloadState(payloadIndex);
+    state.ackedBlocks = Math.max(0, Math.min(state.ackedBlocks, ackedBlocks, state.totalBlocks));
+    return state.ackedBlocks;
+  }
+
+  markPayloadComplete(index) {
+    const state = this.payloadState(index);
+    state.ackedBlocks = state.totalBlocks;
+  }
+
+  isPayloadComplete(index) {
+    const state = this.payloadState(index);
+    return state.ackedBlocks >= state.totalBlocks;
+  }
+
+  isComplete() {
+    if (this.blockSize === null) {
+      return false;
+    }
+    return this.payloads.every((payload) => payload.ackedBlocks >= payload.totalBlocks);
+  }
+
+  summary() {
+    const totalBytes = this.payloads.reduce((sum, payload) => sum + payload.byteLength, 0);
+    const completedBytes = this.payloads.reduce((sum, payload) => (
+      sum + Math.min(payload.ackedBlocks * (this.blockSize ?? 0), payload.byteLength)
+    ), 0);
+    const totalBlocks = this.payloads.reduce((sum, payload) => sum + payload.totalBlocks, 0);
+    const ackedBlocks = this.payloads.reduce((sum, payload) => sum + payload.ackedBlocks, 0);
+
+    return {
+      blockSize: this.blockSize,
+      prepared: this.blockSize !== null,
+      completedBytes,
+      totalBytes,
+      ackedBlocks,
+      totalBlocks,
+      complete: this.isComplete(),
+      payloads: this.payloads.map((payload) => ({
+        index: payload.index,
+        address: `0x${payload.address.toString(16)}`,
+        byteLength: payload.byteLength,
+        paddedLength: payload.paddedLength,
+        ackedBlocks: payload.ackedBlocks,
+        totalBlocks: payload.totalBlocks,
+        written: Math.min(payload.ackedBlocks * (this.blockSize ?? 0), payload.byteLength),
+      })),
+    };
+  }
+}
+
+export class ESPFlasher {
+  /**
+   * @param {SerialPort} port WebSerial port, closed before connect().
+   * @param {object} opts
+   * @param {function} opts.log Log callback.
+   * @param {typeof ESPLoader} opts.ESPLoader Test seam for offline adapter tests.
+   * @param {typeof Transport} opts.Transport Test seam for offline adapter tests.
+   */
+  constructor(port, opts = {}) {
+    this.port = port;
+    this.log = opts.log || (() => {});
+    this.LoaderClass = opts.ESPLoader ?? ESPLoader;
+    this.TransportClass = opts.Transport ?? Transport;
+    this.serial = serialEventTarget(opts.serial);
+    this.loader = null;
+    this.transport = null;
+    this.chipName = null;
+    this.secureDownloadMode = false;
+    this.watchdogFeedSupported = false;
+    this._deviceLost = false;
+    this._activePayload = null;
+    this._flashFinishRequested = false;
+    this._disconnectWaiters = new Set();
+    this._removeSerialDisconnectListener = this._installSerialDisconnectListener();
+  }
+
+  async connect(baudrate = DEFAULT_INITIAL_BAUDRATE, options = {}) {
+    throwIfAborted(options.signal);
+
+    const initialBaudrate = baudrate ?? DEFAULT_INITIAL_BAUDRATE;
+    const flashBaudrate = options.flashBaudrate ?? DEFAULT_FLASH_BAUDRATE;
+    const finalBaudrate = flashBaudrate ?? initialBaudrate;
+    const connectAttempts = options.connectAttempts ?? 7;
+    const resetMode = options.resetMode ?? 'default_reset';
+
+    this.log(`rom:connect:start${diagnosticDetail({
+      initialBaudrate,
+      flashBaudrate,
+      finalBaudrate,
+      resetMode,
+      connectAttempts,
+      flashSize: EP01_FLASH_SIZE,
+      flashSizeBytes: EP01_FLASH_SIZE_BYTES,
+      port: summarizePort(this.port),
+    })}`);
+
+    this.transport = new this.TransportClass(this.port, Boolean(options.tracing));
+    if (typeof this.transport.setDeviceLostCallback === 'function') {
+      this.transport.setDeviceLostCallback(() => {
+        this._deviceLost = true;
+        this.log(`rom:transport:port-lost${diagnosticDetail({
+          port: summarizePort(this.port),
+        })}`);
+      });
+    }
+
+    this.loader = new this.LoaderClass({
+      transport: this.transport,
+      baudrate: finalBaudrate,
+      terminal: terminalFromLog(this.log),
+      debugLogging: Boolean(options.debugLogging),
+      enableTracing: Boolean(options.tracing),
+      serialOptions: options.serialOptions,
+      resetConstructors: options.resetConstructors,
+    });
+
+    if ('romBaudrate' in this.loader) {
+      this.loader.romBaudrate = initialBaudrate;
+    }
+
+    await this._withAbortRace(
+      this.loader.connect(resetMode, connectAttempts, true),
+      options.signal,
+      'rom-connect',
+    );
+    throwIfAborted(options.signal);
+    this.chipName = this.loader.chip?.CHIP_NAME ?? 'unknown';
+    this.secureDownloadMode = Boolean(this.loader.secureDownloadMode);
+
+    this._forceRomFlashWriteSize();
+    this._installSectorEraseRounding();
+    this._installFlashBlockInstrumentation();
+
+    if (this._shouldConfigureSpiFlash()) {
+      throwIfAborted(options.signal);
+      this.log(`rom:spi-config:start${diagnosticDetail({
+        chipName: this.chipName,
+        secureDownloadMode: this.secureDownloadMode,
+        flashSize: EP01_FLASH_SIZE,
+        flashSizeBytes: EP01_FLASH_SIZE_BYTES,
+      })}`);
+      await this._withAbortRace(this.loader.flashSpiAttach(0), options.signal, 'rom-spi-attach');
+      await this._withAbortRace(
+        this.loader.flashSetParameters(EP01_FLASH_SIZE_BYTES),
+        options.signal,
+        'rom-spi-set-parameters',
+      );
+      this.log('rom:spi-config:complete');
+    }
+
+    await this._configureWatchdogsForFlash(options.signal);
+
+    if (flashBaudrate && flashBaudrate !== initialBaudrate) {
+      throwIfAborted(options.signal);
+      await this._withAbortRace(this.loader.changeBaud(), options.signal, 'rom-change-baud');
+    }
+    throwIfAborted(options.signal);
+
+    this.log(`rom:connect:complete${diagnosticDetail({
+      chipName: this.chipName,
+      secureDownloadMode: this.secureDownloadMode,
+      isStub: Boolean(this.loader.IS_STUB),
+      flashWriteSize: this.loader.FLASH_WRITE_SIZE,
+      port: summarizePort(this.port),
+    })}`);
+    return this.chipName;
+  }
+
+  async flash(payloads, onProgress = null, options = {}) {
+    throwIfAborted(options.signal);
+
+    if (!this.loader) {
+      throw new Error('ESPFlasher.connect() must be called before flash()');
+    }
+
+    const normalizedPayloads = payloads.map(normalizePayload);
+    const progressTracker = options.progressTracker ?? new FlashProgressTracker(normalizedPayloads);
+    progressTracker.prepare(normalizedPayloads, this.loader.FLASH_WRITE_SIZE);
+    this.log(`rom:flash:start${diagnosticDetail({
+      payloadCount: normalizedPayloads.length,
+      payloads: summarizePayloads(normalizedPayloads),
+      secureDownloadMode: this.secureDownloadMode,
+      compress: false,
+      flashSize: EP01_FLASH_SIZE,
+      isStub: Boolean(this.loader.IS_STUB),
+      progress: progressTracker.summary(),
+    })}`);
+
+    this._flashFinishRequested = false;
+
+    if (this._shouldConfigureSpiFlash() && typeof this.loader.flashSetParameters === 'function') {
+      throwIfAborted(options.signal);
+      this.log(`rom:flash:spi-config:start${diagnosticDetail({
+        flashSize: EP01_FLASH_SIZE,
+        flashSizeBytes: EP01_FLASH_SIZE_BYTES,
+        secureDownloadMode: this.secureDownloadMode,
+      })}`);
+      await this._withAbortRace(
+        this.loader.flashSetParameters(EP01_FLASH_SIZE_BYTES),
+        options.signal,
+        'flash-spi-set-parameters',
+      );
+      this.log('rom:flash:spi-config:complete');
+    }
+
+    let lastBlockTimeout = this.loader.DEFAULT_TIMEOUT ?? 3000;
+
+    for (let index = 0; index < normalizedPayloads.length; index += 1) {
+      throwIfAborted(options.signal);
+      const payload = normalizedPayloads[index];
+      const paddedImage = padTo(payload.data, FLASH_ALIGNMENT_BYTES);
+      const payloadProgress = progressTracker.payloadState(index);
+      let resumeOffset = payloadProgress.ackedBlocks * this.loader.FLASH_WRITE_SIZE;
+
+      if (resumeOffset > 0 && !progressTracker.isPayloadComplete(index)) {
+        const alignedResumeOffset = sectorAlignedResumeOffset(
+          payload.address,
+          resumeOffset,
+          this.loader.FLASH_WRITE_SIZE,
+        );
+
+        if (alignedResumeOffset < resumeOffset) {
+          const previousAckedBlocks = payloadProgress.ackedBlocks;
+          const previousResumeOffset = resumeOffset;
+          const alignedAckedBlocks = Math.floor(alignedResumeOffset / this.loader.FLASH_WRITE_SIZE);
+          progressTracker.rollbackPayload(index, alignedAckedBlocks);
+          resumeOffset = payloadProgress.ackedBlocks * this.loader.FLASH_WRITE_SIZE;
+          this.log(`rom:flash-payload:resume-rollback${diagnosticDetail({
+            index,
+            address: `0x${payload.address.toString(16)}`,
+            previousAckedBlocks,
+            ackedBlocks: payloadProgress.ackedBlocks,
+            previousResumeOffset,
+            resumeOffset,
+            sectorSize: FLASH_SECTOR_SIZE,
+          })}`);
+        }
       }
 
-      return { flags, chipId };
-    } catch (e) {
-      this.log(`GET_SECURITY_INFO failed: ${e.message}`);
+      this._activePayload = {
+        index,
+        address: payload.address,
+        byteLength: payload.data.length,
+        paddedLength: paddedImage.length,
+        totalBlocks: payloadProgress.totalBlocks,
+        baseBlock: payloadProgress.ackedBlocks,
+        progressTracker,
+        signal: options.signal,
+        startedAt: nowMs(),
+      };
+
+      this.log(`rom:flash-payload:start${diagnosticDetail({
+        index,
+        address: `0x${payload.address.toString(16)}`,
+        byteLength: payload.data.length,
+        resumeOffset,
+        ackedBlocks: payloadProgress.ackedBlocks,
+        totalBlocks: payloadProgress.totalBlocks,
+      })}`);
+
+      const reportProgress = (written, total) => {
+        onProgress?.(index, written, total);
+        options.onPayloadProgress?.(index, written, total, index);
+      };
+
+      try {
+        if (payload.data.length === 0) {
+          this.log(`rom:flash-payload:skipped-empty${diagnosticDetail({
+            index,
+            address: `0x${payload.address.toString(16)}`,
+          })}`);
+          reportProgress(0, 0);
+          continue;
+        }
+
+        if (progressTracker.isPayloadComplete(index)) {
+          this.log(`rom:flash-payload:skipped-complete${diagnosticDetail({
+            index,
+            address: `0x${payload.address.toString(16)}`,
+            byteLength: payload.data.length,
+            ackedBlocks: payloadProgress.ackedBlocks,
+            totalBlocks: payloadProgress.totalBlocks,
+          })}`);
+          reportProgress(payload.data.length, payload.data.length);
+          continue;
+        }
+
+        reportProgress(progressTracker.payloadWritten(index), payload.data.length);
+        const remainingLength = paddedImage.length - resumeOffset;
+        const beginAddress = payload.address + resumeOffset;
+        throwIfAborted(options.signal);
+        const blocks = await this._withAbortRace(
+          this.loader.flashBegin(remainingLength, beginAddress),
+          options.signal,
+          `flash-payload-${index}-begin`,
+        );
+        this.log(`rom:flash-payload:begin-complete${diagnosticDetail({
+          index,
+          address: `0x${beginAddress.toString(16)}`,
+          byteLength: payload.data.length,
+          paddedLength: paddedImage.length,
+          remainingLength,
+          resumeOffset,
+          blocks,
+          ackedBlocks: payloadProgress.ackedBlocks,
+          totalBlocks: payloadProgress.totalBlocks,
+          flashWriteSize: this.loader.FLASH_WRITE_SIZE,
+        })}`);
+
+        let sequence = 0;
+        let imageOffset = resumeOffset;
+        while (sequence < blocks) {
+          throwIfAborted(options.signal);
+          const blockSize = Math.min(this.loader.FLASH_WRITE_SIZE, paddedImage.length - imageOffset);
+          const paddedBlockSize = blockSize < this.loader.FLASH_WRITE_SIZE
+            ? this.loader.FLASH_WRITE_SIZE
+            : blockSize;
+          let block = paddedImage.slice(imageOffset, imageOffset + blockSize);
+          if (block.length < paddedBlockSize) {
+            block = padTo(block, paddedBlockSize);
+          }
+
+          lastBlockTimeout = flashBlockTimeout(this.loader);
+          await this.loader.flashBlock(block, sequence, lastBlockTimeout);
+          throwIfAborted(options.signal);
+
+          imageOffset += blockSize;
+          sequence += 1;
+          reportProgress(progressTracker.payloadWritten(index), payload.data.length);
+        }
+      } catch (error) {
+        if (options.signal?.aborted) {
+          throw abortError(options.signal);
+        }
+
+        if (this._deviceLost || isSerialDisconnectError(error)) {
+          this.log(`rom:flash:disconnect-detected${diagnosticDetail({
+            index,
+            address: `0x${payload.address.toString(16)}`,
+            byteLength: payload.data.length,
+            progress: progressTracker.summary(),
+            error: error.message,
+            port: summarizePort(this.port),
+          })}`);
+          throw new SerialPortLostError(`Serial port lost during firmware flash: ${error.message}`, { cause: error });
+        }
+        throw error;
+      } finally {
+        this._activePayload = null;
+      }
+
+      this.log(`rom:flash-payload:complete${diagnosticDetail({
+        index,
+        address: `0x${payload.address.toString(16)}`,
+        byteLength: payload.data.length,
+      })}`);
+    }
+
+    await this._finishFlashSession(lastBlockTimeout, options.signal);
+    this.log('rom:flash:complete');
+  }
+
+  async reboot(signal = null) {
+    throwIfAborted(signal);
+
+    if (!this.loader) {
+      return;
+    }
+
+    this.log(`rom:reboot:start${diagnosticDetail({
+      secureDownloadMode: this.secureDownloadMode,
+      isStub: Boolean(this.loader.IS_STUB),
+      port: summarizePort(this.port),
+    })}`);
+
+    if (this.secureDownloadMode) {
+      if (this._flashFinishRequested) {
+        this.log('rom:reboot:skipped-sdm-flash-finish-already-requested');
+        return;
+      }
+
+      await this._finishFlashSession(this.loader.DEFAULT_TIMEOUT ?? 3000, signal);
+      return;
+    }
+
+    try {
+      await this._withAbortRace(this.loader.softReset(false), signal, 'rom-reboot');
+      this.log('rom:reboot:complete');
+    } catch (error) {
+      if (signal?.aborted) {
+        throw abortError(signal);
+      }
+      if (isSerialDisconnectError(error)) {
+        throw new SerialPortLostError(`Serial port lost during firmware reboot: ${error.message}`, { cause: error });
+      }
+      throw error;
+    }
+  }
+
+  async disconnect() {
+    this.log(`rom:disconnect:start${diagnosticDetail({
+      port: summarizePort(this.port),
+    })}`);
+
+    this._removeSerialDisconnectListener?.();
+    this._removeSerialDisconnectListener = null;
+
+    if (this.transport && typeof this.transport.disconnect === 'function') {
+      try {
+        await this.transport.disconnect();
+      } catch (error) {
+        this.log(`rom:disconnect:ignored-error${diagnosticDetail({
+          error: error.message,
+          port: summarizePort(this.port),
+        })}`);
+      }
+    }
+
+    this.log(`rom:disconnect:complete${diagnosticDetail({
+      port: summarizePort(this.port),
+    })}`);
+  }
+
+  _shouldConfigureSpiFlash() {
+    return this.secureDownloadMode || this.chipName === CHIP_NAME_ESP32_C6;
+  }
+
+  async _finishFlashSession(timeout, signal = null) {
+    throwIfAborted(signal);
+
+    if (this.secureDownloadMode) {
+      this.log(`rom:flash-finish:start${diagnosticDetail({
+        reboot: true,
+        secureDownloadMode: true,
+        timeout,
+      })}`);
+
+      try {
+        await this._withAbortRace(this.loader.flashFinish(true, timeout), signal, 'flash-finish');
+        this.log('rom:flash-finish:complete');
+      } catch (error) {
+        if (signal?.aborted) {
+          throw abortError(signal);
+        }
+
+        if (this._deviceLost || isSerialDisconnectError(error)) {
+          this.log(`rom:flash-finish:disconnect-detected${diagnosticDetail({
+            error: error.message,
+            port: summarizePort(this.port),
+          })}`);
+          throw new SerialPortLostError(`Serial port lost during firmware flash finish: ${error.message}`, { cause: error });
+        }
+
+        this.log(`rom:flash-finish:ignored-sdm-error${diagnosticDetail({
+          error: error.message,
+        })}`);
+      }
+
+      this._flashFinishRequested = true;
+      return;
+    }
+
+    if (this.loader.IS_STUB && typeof this.loader.flashFinish === 'function') {
+      this.log(`rom:flash-finish:start${diagnosticDetail({
+        reboot: false,
+        secureDownloadMode: false,
+        timeout,
+      })}`);
+      await this._withAbortRace(this.loader.flashFinish(false, timeout), signal, 'flash-finish');
+      this._flashFinishRequested = true;
+      this.log('rom:flash-finish:complete');
+    }
+  }
+
+  _forceRomFlashWriteSize() {
+    const chipFlashWriteSize = this.loader?.chip?.FLASH_WRITE_SIZE;
+    if (Number.isInteger(chipFlashWriteSize) && chipFlashWriteSize > 0) {
+      this.loader.FLASH_WRITE_SIZE = chipFlashWriteSize;
+    }
+  }
+
+  _installSectorEraseRounding() {
+    if (!this.loader?.chip || this.loader.chip._enodyEraseRoundingInstalled) {
+      return;
+    }
+
+    const chip = this.loader.chip;
+    const originalGetEraseSize = chip.getEraseSize?.bind(chip) ?? ((_offset, size) => size);
+    chip.getEraseSize = (offset, size) => {
+      const rawEraseSize = originalGetEraseSize(offset, size);
+      const roundedEraseSize = roundEraseSizeToSectors(rawEraseSize);
+      this.log(`rom:flash-begin:erase-size${diagnosticDetail({
+        offset: `0x${offset.toString(16)}`,
+        size,
+        rawEraseSize,
+        roundedEraseSize,
+        sectorSize: FLASH_SECTOR_SIZE,
+      })}`);
+      return roundedEraseSize;
+    };
+    chip._enodyEraseRoundingInstalled = true;
+  }
+
+  _installFlashBlockInstrumentation() {
+    if (!this.loader || this.loader._enodyFlashBlockInstrumentationInstalled) {
+      return;
+    }
+
+    const originalFlashBlock = this.loader.flashBlock.bind(this.loader);
+    this.loader.flashBlock = async (data, seq, timeout) => {
+      const activePayload = this._activePayload;
+      const flashWriteSize = this.loader.FLASH_WRITE_SIZE;
+      const absoluteSeq = (activePayload?.baseBlock ?? 0) + seq;
+      const blockNumber = absoluteSeq + 1;
+      const numBlocks = activePayload
+        ? activePayload.totalBlocks
+        : null;
+      const startByte = absoluteSeq * flashWriteSize;
+      const endByte = activePayload
+        ? Math.min(startByte + flashWriteSize, activePayload.byteLength)
+        : startByte + data.length;
+      const blockAddress = activePayload ? activePayload.address + startByte : null;
+      const blockStartedAt = nowMs();
+
+      if (seq > 0 && seq % WATCHDOG_FEED_BLOCK_INTERVAL === 0) {
+        await this._feedWatchdog(`flash-data-block-${blockNumber}`);
+      }
+
+      this.log(`rom:flash-data:block:start${diagnosticDetail({
+        payloadIndex: activePayload?.index ?? null,
+        blockNumber,
+        numBlocks,
+        seq,
+        absoluteSeq,
+        address: blockAddress === null ? null : `0x${blockAddress.toString(16)}`,
+        bytes: `${startByte}-${endByte}`,
+        paddedLength: data.length,
+        timeout,
+      })}`);
+
+      try {
+        await this._withSerialDisconnectRace(
+          originalFlashBlock(data, seq, timeout),
+          `flash-data-block-${blockNumber}`,
+          activePayload?.signal,
+        );
+        activePayload?.progressTracker?.acknowledgeBlock(activePayload.index, absoluteSeq);
+        this.log(`rom:flash-data:block:ack${diagnosticDetail({
+          payloadIndex: activePayload?.index ?? null,
+          blockNumber,
+          numBlocks,
+          seq,
+          absoluteSeq,
+          address: blockAddress === null ? null : `0x${blockAddress.toString(16)}`,
+          bytes: `${startByte}-${endByte}`,
+          elapsedMs: Math.round(nowMs() - blockStartedAt),
+          totalElapsedMs: activePayload ? Math.round(nowMs() - activePayload.startedAt) : null,
+        })}`);
+      } catch (error) {
+        this.log(`rom:flash-data:block:failed${diagnosticDetail({
+          payloadIndex: activePayload?.index ?? null,
+          blockNumber,
+          numBlocks,
+          seq,
+          absoluteSeq,
+          address: blockAddress === null ? null : `0x${blockAddress.toString(16)}`,
+          bytes: `${startByte}-${endByte}`,
+          elapsedMs: Math.round(nowMs() - blockStartedAt),
+          totalElapsedMs: activePayload ? Math.round(nowMs() - activePayload.startedAt) : null,
+          error: error.message,
+          port: summarizePort(this.port),
+        })}`);
+        throw error;
+      }
+    };
+    this.loader._enodyFlashBlockInstrumentationInstalled = true;
+  }
+
+  _installSerialDisconnectListener() {
+    if (!this.serial?.addEventListener || !this.serial?.removeEventListener) {
       return null;
     }
-  }
 
-  // ── SPI flash commands ────────────────────────────────────────────────
-
-  async _spiAttach() {
-    // ROM mode: 8 bytes (hspi_arg=0, is_legacy=0)
-    const data = new Uint8Array([...packU32(0), ...packU32(0)]);
-    await this._command(CMD.SPI_ATTACH, data, 0, DEFAULT_TIMEOUT);
-  }
-
-  async _spiSetParams(totalSize) {
-    // 24 bytes: fl_id, total_size, block_size, sector_size, page_size, status_mask
-    const data = new Uint8Array([
-      ...packU32(0),          // fl_id
-      ...packU32(totalSize),  // total_size
-      ...packU32(0x10000),    // block_size (64KB)
-      ...packU32(0x1000),     // sector_size (4KB)
-      ...packU32(0x100),      // page_size (256B)
-      ...packU32(0xffff),     // status_mask
-    ]);
-    await this._command(CMD.SPI_SET_PARAMS, data, 0, DEFAULT_TIMEOUT);
-  }
-
-  // ── Flash write ───────────────────────────────────────────────────────
-
-  async _flashPayload(firmware, address, onProgress) {
-    const numBlocks = Math.ceil(firmware.length / FLASH_WRITE_SIZE);
-    const eraseSize = firmware.length; // ESP32-C6 getEraseSize returns size directly
-
-    // FLASH_BEGIN: prepare flash region
-    // ROM format: 20 bytes (erase_size, num_blocks, block_size, offset, encrypted=0)
-    const beginData = new Uint8Array([
-      ...packU32(eraseSize),
-      ...packU32(numBlocks),
-      ...packU32(FLASH_WRITE_SIZE),
-      ...packU32(address),
-      ...packU32(0), // encrypted=0 (MUST be 0 for SDM)
-    ]);
-
-    const eraseTimeout = Math.max(DEFAULT_TIMEOUT,
-      Math.ceil(ERASE_WRITE_TIMEOUT_PER_MB * eraseSize / 1000000));
-    this.log(`Preparing flash region at 0x${address.toString(16)} (${eraseSize} bytes)...`);
-    await this._command(CMD.FLASH_BEGIN, beginData, 0, eraseTimeout);
-    this.log(`Writing ${numBlocks} block${numBlocks === 1 ? '' : 's'}...`);
-
-    // FLASH_DATA: write blocks
-    for (let seq = 0; seq < numBlocks; seq++) {
-      const start = seq * FLASH_WRITE_SIZE;
-      const end = Math.min(start + FLASH_WRITE_SIZE, firmware.length);
-      const chunk = firmware.slice(start, end);
-
-      // Pad to FLASH_WRITE_SIZE with 0xFF
-      const padded = new Uint8Array(FLASH_WRITE_SIZE);
-      padded.fill(0xff);
-      padded.set(chunk);
-
-      // FLASH_DATA header: 16 bytes + data
-      const header = new Uint8Array([
-        ...packU32(padded.length),
-        ...packU32(seq),
-        ...packU32(0), // reserved
-        ...packU32(0), // reserved
-      ]);
-
-      const packet = new Uint8Array(header.length + padded.length);
-      packet.set(header);
-      packet.set(padded, header.length);
-
-      const blockTimeout = Math.max(DEFAULT_TIMEOUT,
-        Math.ceil(ERASE_WRITE_TIMEOUT_PER_MB * FLASH_WRITE_SIZE / 1000000));
-      await this._command(CMD.FLASH_DATA, packet, checksum(padded), blockTimeout);
-
-      if (onProgress) onProgress(end, firmware.length);
-    }
-  }
-
-  // ── Low-level command protocol ────────────────────────────────────────
-  //
-  // Command packet format (before SLIP encoding):
-  //   Byte 0:     0x00 (direction: request)
-  //   Byte 1:     opcode
-  //   Byte 2-3:   data length (uint16 LE)
-  //   Byte 4-7:   checksum (uint32 LE)
-  //   Byte 8+:    data
-  //
-  // Response packet format (after SLIP decoding):
-  //   Byte 0:     0x01 (direction: response)
-  //   Byte 1:     opcode (echoed)
-  //   Byte 2-3:   unused
-  //   Byte 4-7:   value (uint32 LE)
-  //   Byte 8+:    response data
-  //   Last 2:     status (0 = success) + error code
-
-  async _command(opcode, data, cs = 0, timeout = DEFAULT_TIMEOUT) {
-    // Build command packet
-    const packet = new Uint8Array(8 + data.length);
-    packet[0] = 0x00; // direction: request
-    packet[1] = opcode;
-    packet[2] = data.length & 0xff;
-    packet[3] = (data.length >> 8) & 0xff;
-    packet[4] = cs & 0xff;
-    packet[5] = (cs >> 8) & 0xff;
-    packet[6] = (cs >> 16) & 0xff;
-    packet[7] = (cs >> 24) & 0xff;
-    packet.set(data, 8);
-
-    // Send SLIP-encoded packet
-    await this.transport.writeSlip(packet);
-
-    // Read response
-    try {
-      return await this._readResponse(opcode, timeout);
-    } catch (error) {
-      const commandName = CMD_NAMES[opcode] ?? `0x${opcode.toString(16)}`;
-      throw new Error(`${commandName} failed: ${error.message}`);
-    }
-  }
-
-  async _readResponse(expectedOp, timeout = DEFAULT_TIMEOUT) {
-    const deadline = Date.now() + timeout;
-    let resp = null;
-
-    while (Date.now() < deadline) {
-      resp = await this.transport.readSlip(Math.max(1, deadline - Date.now()));
-      if (resp.length >= 2 && resp[1] !== expectedOp) {
-        continue;
+    const onDisconnect = (event) => {
+      const eventPort = event?.target ?? null;
+      if (eventPort && !serialPortsMatch(eventPort, this.port)) {
+        return;
       }
-      break;
+
+      this._deviceLost = true;
+      const error = new SerialPortLostError('Serial port disconnected during firmware flash');
+      this.log(`rom:serial:disconnect-event${diagnosticDetail({
+        port: summarizePort(eventPort ?? this.port),
+      })}`);
+
+      for (const reject of this._disconnectWaiters) {
+        reject(error);
+      }
+      this._disconnectWaiters.clear();
+    };
+
+    this.serial.addEventListener('disconnect', onDisconnect);
+    this.log('rom:serial:disconnect-listener-installed');
+    return () => {
+      this.serial.removeEventListener('disconnect', onDisconnect);
+      this.log('rom:serial:disconnect-listener-removed');
+    };
+  }
+
+  _withAbortRace(operationPromise, signal = null, operation = 'operation') {
+    if (!signal?.addEventListener) {
+      return operationPromise;
     }
 
-    if (!resp) {
-      throw new Error('Read timeout');
+    if (signal.aborted) {
+      return Promise.reject(abortError(signal, operation));
     }
 
-    if (resp.length < 8) {
-      throw new Error(`Response too short (${resp.length} bytes)`);
+    let onAbort = null;
+    const abortPromise = new Promise((_, reject) => {
+      onAbort = () => {
+        reject(abortError(signal, operation));
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+    });
+
+    return Promise.race([operationPromise, abortPromise]).finally(() => {
+      if (onAbort) {
+        signal.removeEventListener('abort', onAbort);
+      }
+    });
+  }
+
+  _withSerialDisconnectRace(operationPromise, operation, signal = null) {
+    if (!this.serial?.addEventListener) {
+      return this._withAbortRace(operationPromise, signal, operation);
     }
 
-    const direction = resp[0]; // Should be 0x01
-    const opcode = resp[1];
-    const value = unpackU32(resp, 4);
-
-    // Response data is everything after the 8-byte header,
-    // except the last 2 bytes which are status/error
-    const dataEnd = resp.length >= 10 ? resp.length - 2 : 8;
-    const data = resp.slice(8, dataEnd);
-
-    // Status is in the last 2 bytes (if present)
-    const status = resp.length >= 10 ? resp[resp.length - 2] : 0;
-    const error = resp.length >= 10 ? resp[resp.length - 1] : 0;
-
-    if (direction !== 0x01) {
-      throw new Error(`Unexpected response direction: 0x${direction.toString(16)}`);
+    if (signal?.aborted) {
+      return Promise.reject(abortError(signal, operation));
     }
 
-    if (status !== 0) {
-      throw new Error(`Command 0x${expectedOp.toString(16)} failed with status ${status}, error ${error}`);
+    let rejectDisconnect = null;
+    const disconnectPromise = new Promise((_, reject) => {
+      rejectDisconnect = reject;
+      if (this._deviceLost) {
+        reject(new SerialPortLostError(`Serial port disconnected during ${operation}`));
+        return;
+      }
+      this._disconnectWaiters.add(reject);
+    });
+
+    return this._withAbortRace(
+      Promise.race([operationPromise, disconnectPromise]),
+      signal,
+      operation,
+    ).finally(() => {
+      if (rejectDisconnect) {
+        this._disconnectWaiters.delete(rejectDisconnect);
+      }
+    });
+  }
+
+  async _configureWatchdogsForFlash(signal = null) {
+    throwIfAborted(signal);
+
+    if (this.chipName !== CHIP_NAME_ESP32_C6 || typeof this.loader?.writeReg !== 'function') {
+      this.log(`rom:watchdog:skipped${diagnosticDetail({
+        chipName: this.chipName,
+        hasWriteReg: Boolean(this.loader?.writeReg),
+      })}`);
+      return;
     }
 
-    return { opcode, value, data };
+    this.log(`rom:watchdog:disable:start${diagnosticDetail({
+      chipName: this.chipName,
+      secureDownloadMode: this.secureDownloadMode,
+    })}`);
+
+    try {
+      await this._withAbortRace(this.loader.writeReg(ESP32_C6_LP_WDT_WPROTECT_REG, WDT_WKEY), signal, 'watchdog-disable');
+      await this._withAbortRace(this.loader.writeReg(ESP32_C6_LP_WDT_FEED_REG, ESP32_C6_WDT_FEED), signal, 'watchdog-disable');
+      await this._withAbortRace(this.loader.writeReg(ESP32_C6_LP_WDT_CONFIG0_REG, 0), signal, 'watchdog-disable');
+      await this._withAbortRace(this.loader.writeReg(ESP32_C6_LP_WDT_WPROTECT_REG, 0), signal, 'watchdog-disable');
+
+      await this._withAbortRace(this.loader.writeReg(ESP32_C6_LP_WDT_SWD_WPROTECT_REG, WDT_WKEY), signal, 'watchdog-disable');
+      await this._withAbortRace(this.loader.writeReg(ESP32_C6_LP_WDT_SWD_CONFIG_REG, ESP32_C6_SWD_AUTO_FEED_EN), signal, 'watchdog-disable');
+      await this._withAbortRace(this.loader.writeReg(ESP32_C6_LP_WDT_SWD_WPROTECT_REG, 0), signal, 'watchdog-disable');
+
+      this.watchdogFeedSupported = true;
+      this.log('rom:watchdog:disable:complete');
+    } catch (error) {
+      if (signal?.aborted) {
+        throw abortError(signal);
+      }
+
+      this.watchdogFeedSupported = false;
+      this.log(`rom:watchdog:disable:failed${diagnosticDetail({
+        error: error.message,
+        secureDownloadMode: this.secureDownloadMode,
+      })}`);
+
+      try {
+        await this.loader.writeReg(ESP32_C6_LP_WDT_WPROTECT_REG, 0);
+        await this.loader.writeReg(ESP32_C6_LP_WDT_SWD_WPROTECT_REG, 0);
+      } catch (protectError) {
+        this.log(`rom:watchdog:reprotect:failed${diagnosticDetail({
+          error: protectError.message,
+        })}`);
+      }
+    }
+  }
+
+  async _feedWatchdog(reason) {
+    if (!this.watchdogFeedSupported) {
+      return;
+    }
+
+    try {
+      await this.loader.writeReg(ESP32_C6_LP_WDT_WPROTECT_REG, WDT_WKEY);
+      await this.loader.writeReg(ESP32_C6_LP_WDT_FEED_REG, ESP32_C6_WDT_FEED);
+      await this.loader.writeReg(ESP32_C6_LP_WDT_WPROTECT_REG, 0);
+      this.log(`rom:watchdog:feed${diagnosticDetail({ reason })}`);
+    } catch (error) {
+      this.watchdogFeedSupported = false;
+      this.log(`rom:watchdog:feed:failed${diagnosticDetail({
+        reason,
+        error: error.message,
+      })}`);
+    }
   }
 }

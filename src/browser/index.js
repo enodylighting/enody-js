@@ -14,6 +14,20 @@ setDefaultSerialProvider({
     }
     return navigator.serial.requestPort(options);
   },
+
+  addEventListener(type, listener, options) {
+    if (typeof navigator === 'undefined' || !navigator.serial?.addEventListener) {
+      return;
+    }
+    navigator.serial.addEventListener(type, listener, options);
+  },
+
+  removeEventListener(type, listener, options) {
+    if (typeof navigator === 'undefined' || !navigator.serial?.removeEventListener) {
+      return;
+    }
+    navigator.serial.removeEventListener(type, listener, options);
+  },
 });
 
 export * from '../public-api.js';

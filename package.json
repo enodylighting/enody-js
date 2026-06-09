@@ -36,7 +36,7 @@
     "access": "public"
   },
   "scripts": {
-    "test": "node test/codec.test.js && node test/reference.test.js && node test/interface.test.js && node test/optimizer.test.js",
+    "test": "node test/codec.test.js && node test/reference.test.js && node test/interface.test.js && node test/optimizer.test.js && node test/update-flasher.test.js",
     "test:hil": "node test/hil.test.js"
   },
   "keywords": [
@@ -49,6 +49,7 @@
   ],
   "license": "MIT",
   "dependencies": {
+    "esptool-js": "github:enodylighting/esptool-js#4f8a08000cc7c7403961b5fc8cac85cddd441be1",
     "serialport": "^13.0.0"
   },
   "repository": {
