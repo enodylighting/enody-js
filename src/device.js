@@ -15,8 +15,11 @@ import {
   Flux,
   Network,
   NetworkCredentials,
+  SENSOR_DATA_STREAMS_KEY,
   decodeConfigurationList,
+  decodeSensorStreams,
   encodeConfigurationList,
+  encodeSensorStreams,
 } from './message.js';
 import { PostcardDecoder, PostcardEncoder, uuidToString } from './postcard.js';
 import { EnodyTransport, EP01_USB_FILTER } from './transport.js';
@@ -375,6 +378,29 @@ export class Runtime {
     const encoder = new PostcardEncoder();
     encodeConfigurationList(encoder, configurations);
     await this.settingSetBytes(CONFIGURATION_PRESETS_KEY, encoder.result());
+  }
+
+  async sensorDataStreams() {
+    return this.getSensorDataStreams();
+  }
+
+  async getSensorDataStreams() {
+    const bytes = await this.settingGetBytes(SENSOR_DATA_STREAMS_KEY);
+    if (bytes === null) {
+      return [];
+    }
+
+    return decodeSensorStreams(new PostcardDecoder(bytes));
+  }
+
+  async setSensorDataStreams(streams) {
+    const encoder = new PostcardEncoder();
+    encodeSensorStreams(encoder, streams);
+    await this.settingSetBytes(SENSOR_DATA_STREAMS_KEY, encoder.result());
+  }
+
+  async disableSensorDataStreams() {
+    await this.setSensorDataStreams([]);
   }
 
   async generateToken(options = {}) {

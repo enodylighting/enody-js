@@ -14,6 +14,8 @@ import {
   Network,
   NetworkCredentials,
   Runtime,
+  SENSOR_DATA_STREAMS_KEY,
+  SensorStream,
   Source,
   SpectralData,
   Version,
@@ -29,8 +31,10 @@ import {
   decodeConfigurationList,
   decodeNetwork,
   decodeNetworkCredentials,
+  decodeSensorStreams,
   encodeConfigurationList,
   encodeNetworkList,
+  encodeSensorStreams,
 } from '../src/message.js';
 import { frameBytes } from '../src/framing.js';
 import { PostcardDecoder, PostcardEncoder, uuidFromString, uuidV4 } from '../src/postcard.js';
@@ -384,6 +388,61 @@ function spectralMeasurementsFromJson(spectralDataJson) {
 
   await runtime.setConfigurationPresets([]);
   assert(deleteKey === CONFIGURATION_PRESETS_KEY, 'Runtime.setConfigurationPresets([]) deletes the preset setting');
+}
+
+// --- Runtime sensor data streams ---
+{
+  const expectedStreams = [SensorStream.FDC1004];
+  const streamBytes = new PostcardEncoder();
+  encodeSensorStreams(streamBytes, expectedStreams);
+  let savedStreamBytes = null;
+
+  const runtime = new Runtime({
+    connected: true,
+    async sendCommand(commandBytes) {
+      if (commandBytes[0] === 2 && commandBytes[1] === 4) {
+        return {
+          event: {
+            event: {
+              type: 'settingGet',
+              key: SENSOR_DATA_STREAMS_KEY,
+              setting: {
+                type: 'public',
+                bytes: streamBytes.result(),
+              },
+            },
+          },
+        };
+      }
+
+      if (commandBytes[0] === 2 && commandBytes[1] === 5) {
+        const decoder = new PostcardDecoder(commandBytes.slice(2));
+        const key = decoder.string();
+        savedStreamBytes = decoder.bytes();
+        return {
+          event: {
+            event: {
+              type: 'settingSet',
+              key,
+            },
+          },
+        };
+      }
+
+      throw new Error(`Unexpected command ${Array.from(commandBytes).join(',')}`);
+    },
+  });
+
+  const streams = await runtime.sensorDataStreams();
+  assert(streams.length === 1 && streams[0] === SensorStream.FDC1004, 'Runtime.sensorDataStreams loads enabled streams');
+
+  await runtime.setSensorDataStreams(expectedStreams);
+  const savedStreams = decodeSensorStreams(new PostcardDecoder(savedStreamBytes));
+  assert(savedStreams.length === 1 && savedStreams[0] === SensorStream.FDC1004, 'Runtime.setSensorDataStreams stores postcard-encoded stream lists');
+
+  await runtime.disableSensorDataStreams();
+  const disabledStreams = decodeSensorStreams(new PostcardDecoder(savedStreamBytes));
+  assert(disabledStreams.length === 0, 'Runtime.disableSensorDataStreams stores an empty stream list');
 }
 
 console.log(`\nResults: ${passed} passed, ${failed} failed`);

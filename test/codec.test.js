@@ -12,6 +12,7 @@ import {
   EventType,
   Network,
   NetworkCredentials,
+  SensorStream,
   WifiAuth,
   buildCommandMessage,
   decodeConfigurationList,
@@ -19,11 +20,16 @@ import {
   encodeNetworkList,
   describeCommand,
   encodeConfigurationList,
+  decodeSensorStreams,
+  encodeSensorStreams,
   errorTypeName,
 } from '../src/message.js';
 
 let passed = 0;
 let failed = 0;
+
+const INTERNAL_EVENT_SENSOR_DATA_VARIANT = 9;
+const SENSOR_DATA_EVENT_FDC1004_VARIANT = 0;
 
 function assert(condition, msg) {
   if (condition) {
@@ -76,6 +82,18 @@ function hostEventFrame(hostEventVariant, encodePayload) {
   enc.option(null, () => {});
   enc.enumVariant(EventType.Host);
   enc.enumVariant(hostEventVariant);
+  encodePayload?.(enc);
+  return frameBytes(enc.result());
+}
+
+function internalEventFrame(internalEventVariant, encodePayload) {
+  const enc = new PostcardEncoder();
+  enc.enumVariant(1); // Message::Event
+  enc.uuid(uuidV4());
+  enc.option(null, () => {});
+  enc.option(null, () => {});
+  enc.enumVariant(EventType.Internal);
+  enc.enumVariant(internalEventVariant);
   encodePayload?.(enc);
   return frameBytes(enc.result());
 }
@@ -291,6 +309,39 @@ function hostEventFrame(hostEventVariant, encodePayload) {
   encodeConfigurationList(enc, presets);
   const decoded = decodeConfigurationList(new PostcardDecoder(enc.result()));
   assertConfigurationListEq(decoded, presets, 'Configuration preset list roundtrip');
+}
+
+{
+  const enc = new PostcardEncoder();
+  encodeSensorStreams(enc, [SensorStream.FDC1004]);
+  const encoded = enc.result();
+  assertEq(Array.from(encoded), [1, 0], 'Sensor stream list encodes FDC1004');
+  const decoded = decodeSensorStreams(new PostcardDecoder(encoded));
+  assertEq(decoded, [SensorStream.FDC1004], 'Sensor stream list decodes FDC1004');
+}
+
+{
+  const message = decodeMessage(internalEventFrame(INTERNAL_EVENT_SENSOR_DATA_VARIANT, (enc) => {
+    enc.enumVariant(SENSOR_DATA_EVENT_FDC1004_VARIANT);
+    enc.varint(3);
+    enc.f32(12);
+    enc.f32(35.4);
+    enc.f32(42.1);
+  }));
+  const sensorEvent = message.event.event;
+  assertEq(message.event.type, 'internal', 'decodeMessage decodes internal event envelope');
+  assertEq(sensorEvent.type, 'sensorData', 'decodeMessage decodes SensorData internal event');
+  assertEq(sensorEvent.event.type, 'fdc1004', 'decodeMessage decodes FDC1004 sensor data');
+  assert(sensorEvent.event.samples.length === 3, 'FDC1004 event includes all samples');
+  assert(Math.abs(sensorEvent.event.samples.at(-1) - 42.1) < 0.01, 'FDC1004 samples decode as f32 values');
+}
+
+{
+  const message = decodeMessage(internalEventFrame(6, (enc) => {
+    enc.f32(15.5);
+  }));
+  assertEq(message.event.type, 'internal', 'unknown internal events retain generic internal envelope');
+  assert(!('event' in message.event), 'unknown internal events are not surfaced as named SDK events');
 }
 
 {

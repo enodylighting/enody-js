@@ -223,6 +223,51 @@ export function decodeLogEvent(dec) {
   return { level, levelName: LogLevelNames[level] || 'Unknown', output };
 }
 
+// --- Sensor data streams ---
+
+export const SENSOR_DATA_STREAMS_KEY = 'dev.enody.sensor-data-streams';
+
+export const SensorStream = {
+  FDC1004: 0,
+};
+
+const INTERNAL_EVENT_SENSOR_DATA_VARIANT = 9;
+const SENSOR_DATA_EVENT_FDC1004_VARIANT = 0;
+
+export function encodeSensorStreams(enc, streams) {
+  enc.varint(streams.length);
+  for (const stream of streams) {
+    enc.enumVariant(stream);
+  }
+}
+
+export function decodeSensorStreams(dec) {
+  const count = dec.varint();
+  const streams = [];
+  for (let index = 0; index < count; index += 1) {
+    streams.push(dec.enumVariant());
+  }
+  return streams;
+}
+
+function decodeSensorSampleBatch(dec) {
+  const count = dec.varint();
+  const samples = [];
+  for (let index = 0; index < count; index += 1) {
+    samples.push(dec.f32());
+  }
+  return samples;
+}
+
+function decodeSensorDataEvent(dec) {
+  const variant = dec.enumVariant();
+  if (variant === SENSOR_DATA_EVENT_FDC1004_VARIANT) {
+    return { type: 'fdc1004', samples: decodeSensorSampleBatch(dec) };
+  }
+
+  return { type: 'unknown' };
+}
+
 // --- Network setup ---
 
 export const NETWORK_SCAN_FILTER_MAX_LEN = 4;
@@ -786,7 +831,7 @@ function decodeEvent(dec) {
     case EventType.Error:
       return { type: 'error', error: decodeError(dec) };
     case EventType.Internal:
-      return { type: 'internal' };
+      return decodeInternalEvent(dec);
     case EventType.Host:
       return { type: 'host', event: decodeHostEvent(dec) };
     case EventType.Runtime:
@@ -802,6 +847,15 @@ function decodeEvent(dec) {
     default:
       throw new Error(`Unknown event type: ${variant}`);
   }
+}
+
+function decodeInternalEvent(dec) {
+  const variant = dec.enumVariant();
+  if (variant === INTERNAL_EVENT_SENSOR_DATA_VARIANT) {
+    return { type: 'internal', event: { type: 'sensorData', event: decodeSensorDataEvent(dec) } };
+  }
+
+  return { type: 'internal' };
 }
 
 function decodeHostEvent(dec) {
