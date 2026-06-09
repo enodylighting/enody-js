@@ -11,7 +11,6 @@ import { compareVersions } from './message.js';
 import { ESPFlasher } from './esp-flasher.js';
 
 export const DEFAULT_FIRMWARE_BASE_URL = 'https://firmware.enody.lighting';
-export const FIRMWARE_FLASH_OFFSET = 0x00020000;
 
 function joinUrl(baseUrl, ...parts) {
   const trimmed = String(baseUrl).replace(/\/+$/, '');
@@ -58,6 +57,31 @@ async function downloadPayload(hostId, payload, baseUrl, fetchImpl, onLog = null
   }
 
   return data;
+}
+
+function assertManifestPayload(payload, version, index) {
+  if (!payload || typeof payload !== 'object') {
+    throw new Error(`Firmware version ${version} payload ${index + 1} is invalid`);
+  }
+
+  if (!Number.isInteger(payload.offset) || payload.offset < 0) {
+    throw new Error(`Firmware version ${version} payload ${index + 1} is missing a valid flash offset`);
+  }
+
+  if (typeof payload.data !== 'string' || payload.data.length === 0) {
+    throw new Error(`Firmware version ${version} payload ${index + 1} is missing a data path`);
+  }
+
+  return payload;
+}
+
+function manifestPayloads(entry) {
+  const payloads = entry?.payload;
+  if (!Array.isArray(payloads) || payloads.length === 0) {
+    throw new Error(`Firmware version ${entry?.version ?? '(unknown)'} has no payload components`);
+  }
+
+  return payloads.map((payload, index) => assertManifestPayload(payload, entry.version, index));
 }
 
 function toUint8Array(image) {
@@ -175,7 +199,7 @@ export class UpdateTarget {
     }
 
     const payloads = [];
-    for (const payload of selected.payload) {
+    for (const payload of manifestPayloads(selected)) {
       payloads.push({
         address: payload.offset,
         data: await downloadPayload(
@@ -192,8 +216,12 @@ export class UpdateTarget {
   }
 
   async flashFirmwareImage(image, options = {}) {
+    if (!Number.isInteger(options.offset) || options.offset < 0) {
+      throw new Error('flashFirmwareImage requires options.offset; manifest updates should use updateDevice()');
+    }
+
     const payload = {
-      address: options.offset ?? FIRMWARE_FLASH_OFFSET,
+      address: options.offset,
       data: toUint8Array(image),
     };
     await this.flashPayloads([payload], options);

@@ -18,6 +18,7 @@ import {
   SensorStream,
   Source,
   SpectralData,
+  UpdateTarget,
   Version,
   WifiAuth,
   sampleEmitter,
@@ -443,6 +444,68 @@ function spectralMeasurementsFromJson(spectralDataJson) {
   await runtime.disableSensorDataStreams();
   const disabledStreams = decodeSensorStreams(new PostcardDecoder(savedStreamBytes));
   assert(disabledStreams.length === 0, 'Runtime.disableSensorDataStreams stores an empty stream list');
+}
+
+// --- Firmware manifest payload components ---
+{
+  const hostId = '12345678-1234-1234-1234-123456789abc';
+  const partitionTable = new Uint8Array([0xaa, 0xbb, 0xcc]);
+  const appImage = new Uint8Array([0x10, 0x20, 0x30, 0x40]);
+  const requests = [];
+  const fetchImpl = async (url) => {
+    requests.push(url);
+    if (url.endsWith('/firmware.json')) {
+      return {
+        ok: true,
+        json: async () => [
+          {
+            version: '1.2.3',
+            payload: [
+              { offset: 0x8000, length: partitionTable.length, data: 'partition-table.bin' },
+              { offset: 0x20000, length: appImage.length, data: 'app.bin' },
+            ],
+          },
+        ],
+      };
+    }
+
+    const body = url.endsWith('/partition-table.bin') ? partitionTable : appImage;
+    return {
+      ok: true,
+      arrayBuffer: async () => body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength),
+    };
+  };
+  const target = new UpdateTarget({
+    host: {
+      identifier: () => hostId,
+      version: () => new Version(1, 0, 0),
+    },
+    baseUrl: 'https://firmware.example',
+    fetchImpl,
+  });
+
+  const payloads = await target.downloadFirmwarePayloads('1.2.3');
+
+  assert(payloads.length === 2, 'UpdateTarget downloads all manifest payload components');
+  assert(payloads[0].address === 0x8000, 'UpdateTarget uses partition-table offset from manifest');
+  assert(payloads[1].address === 0x20000, 'UpdateTarget uses app-image offset from manifest');
+  assert(Array.from(payloads[0].data).join(',') === Array.from(partitionTable).join(','), 'UpdateTarget preserves first payload bytes');
+  assert(Array.from(payloads[1].data).join(',') === Array.from(appImage).join(','), 'UpdateTarget preserves second payload bytes');
+  assert(requests.some((url) => url.endsWith(`/${hostId}/partition-table.bin`)), 'UpdateTarget downloads partition-table path');
+  assert(requests.some((url) => url.endsWith(`/${hostId}/app.bin`)), 'UpdateTarget downloads app-image path');
+}
+
+// --- Manual firmware image flashing requires an explicit offset ---
+{
+  const target = new UpdateTarget({});
+  let failedAsExpected = false;
+  try {
+    await target.flashFirmwareImage(new Uint8Array([0x01]));
+  } catch (error) {
+    failedAsExpected = error.message.includes('options.offset');
+  }
+
+  assert(failedAsExpected, 'UpdateTarget.flashFirmwareImage requires an explicit offset');
 }
 
 console.log(`\nResults: ${passed} passed, ${failed} failed`);
