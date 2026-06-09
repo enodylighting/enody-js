@@ -34,7 +34,7 @@ async function loadSerialPortModule() {
     return await import('serialport');
   } catch (error) {
     throw new Error(
-      'The Node serial backend requires the `serialport` package. Run `npm install enody` to install package dependencies before using Node hardware access.',
+      'The Node serial backend requires the `serialport` package. Run `npm install @enody/enody` to install package dependencies before using Node hardware access.',
       { cause: error },
     );
   }

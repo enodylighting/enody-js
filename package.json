@@ -1,5 +1,5 @@
 {
-  "name": "enody",
+  "name": "@enody/enody",
   "version": "0.1.0",
   "description": "JavaScript SDK for Enody spectrally tunable lighting devices and EP01 firmware updates.",
   "type": "module",
@@ -32,6 +32,9 @@
     "./src/browser/update-entry.js",
     "./src/node/update-entry.js"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "test": "node test/codec.test.js && node test/reference.test.js && node test/interface.test.js && node test/optimizer.test.js",
     "test:hil": "node test/hil.test.js"

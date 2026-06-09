@@ -4,7 +4,7 @@ JavaScript SDK for Enody spectrally tunable lighting devices.
 
 This is an LLM port of the enody-py framework, with modifications to support browser and node backends.
 
-`enody` provides:
+`@enody/enody` provides:
 
 - One import path that works in both the browser and Node.js
 - WebSerial-based discovery and control for EP01 hardware in browser apps
@@ -20,16 +20,16 @@ The browser dashboard that consumes this SDK lives in the sibling
 ## Installation
 
 ```bash
-npm install enody
+npm install @enody/enody
 ```
 
 The package targets modern ESM environments and requires Node 18+ for local tooling.
 
-`import { UsbEnvironment, Configuration, Flux } from 'enody'` resolves to the
+`import { UsbEnvironment, Configuration, Flux } from '@enody/enody'` resolves to the
 appropriate implementation automatically:
 
-- in Node.js, `enody` uses the Node serial backend
-- in browser builds, `enody` uses WebSerial
+- in Node.js, `@enody/enody` uses the Node serial backend
+- in browser builds, `@enody/enody` uses WebSerial
 
 That means the same import works in browser apps, scripts, and Node-backed
 notebooks.
@@ -39,7 +39,7 @@ notebooks.
 ### Discover and connect to a device
 
 ```js
-import { UsbEnvironment } from 'enody';
+import { UsbEnvironment } from '@enody/enody';
 
 const environment = new UsbEnvironment();
 const runtimes = await environment.runtimes();
@@ -56,7 +56,7 @@ const emitters = await sources[0].emitters();
 ### Use the same import in Node or a notebook
 
 ```js
-import { UsbEnvironment, Configuration, Flux } from 'enody';
+import { UsbEnvironment, Configuration, Flux } from '@enody/enody';
 
 const env = new UsbEnvironment();
 const runtime = (await env.runtimes())[0];
@@ -75,7 +75,7 @@ specific port path.
 ### Control a fixture
 
 ```js
-import { Configuration, Flux } from 'enody';
+import { Configuration, Flux } from '@enody/enody';
 
 await fixtures[0].display(
   Configuration.blackbody(4000),
@@ -94,7 +94,7 @@ await fixtures[0].setManual(1.0);
 ### Manage stored appearance presets
 
 ```js
-import { Configuration } from 'enody';
+import { Configuration } from '@enody/enody';
 
 const presets = await runtime.configurationPresets();
 
@@ -135,7 +135,7 @@ include `deviceError` and `command` fields for application-level handling.
 ### Work offline with bundled sample data
 
 ```js
-import { sampleFixture, sampleSource, sampleEmitter } from 'enody';
+import { sampleFixture, sampleSource, sampleEmitter } from '@enody/enody';
 
 const fixture = sampleFixture();
 const source = sampleSource();
@@ -153,7 +153,7 @@ import {
   cieYAction,
   cieZAction,
   sampleSource,
-} from 'enody';
+} from '@enody/enody';
 
 const source = sampleSource();
 const emitters = await source.emitters();
@@ -179,7 +179,7 @@ optimizer.step();
 ### Update firmware
 
 ```js
-import { UpdateTarget } from 'enody';
+import { UpdateTarget } from '@enody/enody';
 
 const [target] = await UpdateTarget.discover();
 const versions = await target.availableFirmware();
